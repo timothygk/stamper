@@ -18,13 +18,16 @@ import (
 type eventType int
 
 const (
-	eventTypeConnClosed eventType = 1
-	eventTypeSend       eventType = 2
-	eventTypeRecv       eventType = 3
+	eventTypeClientClosing eventType = 0
+	eventTypeConnClosed    eventType = 1
+	eventTypeSend          eventType = 2
+	eventTypeRecv          eventType = 3
 )
 
 func (e eventType) String() string {
 	switch e {
+	case eventTypeClientClosing:
+		return "client_closing"
 	case eventTypeConnClosed:
 		return "conn_closed"
 	case eventTypeSend:
@@ -60,6 +63,8 @@ func (e *event) String() string {
 		e.recvEnvelope.JsonStr(),
 	)
 }
+
+var ErrAnotherRequestInflight = errors.New("there's another request inflight")
 
 type ClientConfig struct {
 	ClientId      uint64
@@ -108,15 +113,15 @@ func NewClient(
 }
 
 func (c *Client) Close() error {
-	close(c.replyCh)
 	close(c.closing)
+	c.events <- event{etype: eventTypeClientClosing}
 	<-c.closed
 	return nil
 }
 
 func (c *Client) Request(body []byte) ([]byte, error) {
 	if !c.isInflight.CompareAndSwap(false, true) {
-		return nil, errors.New("still inflight")
+		return nil, ErrAnotherRequestInflight
 	}
 	defer c.isInflight.Store(false)
 
@@ -165,9 +170,17 @@ func (c *Client) Request(body []byte) ([]byte, error) {
 }
 
 func (c *Client) loop() {
+EventLoop:
 	for e := range c.events {
 		// fmt.Printf("Event %s\n", e.String())
 		switch e.etype {
+		case eventTypeClientClosing:
+			for _, conn := range c.serverConns {
+				if conn != nil {
+					conn.Close()
+				}
+			}
+			break EventLoop // stop processing
 		case eventTypeConnClosed:
 			err := c.serverConns[e.serverIdx].Close()
 			if err != nil {
@@ -213,6 +226,7 @@ func (c *Client) loop() {
 			c.replyCh <- reply
 		}
 	}
+
 	close(c.closed)
 }
 
@@ -226,16 +240,11 @@ func (c *Client) send(serverIdx int, request *stamper.Request) {
 
 func (c *Client) listen(serverIdx int, conn net.Conn) {
 	defer func() {
-		err := conn.Close()
-		if err != nil {
-			// TODO: log
-		}
 		c.events <- event{
 			etype:     eventTypeConnClosed,
 			serverIdx: serverIdx,
 		} // handled by the Run() goroutine
 	}()
-	defer conn.Close()
 	for {
 		select {
 		case <-c.closing:

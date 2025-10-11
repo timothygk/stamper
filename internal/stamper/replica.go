@@ -36,14 +36,16 @@ type clientTable struct {
 type eventType int
 
 const (
-	// TODO: add eventTypeClose
-	eventTypeSend        eventType = 1
-	eventTypeCommitDelay eventType = 2
-	eventTypeMsgRecv     eventType = 100
+	eventTypeReplicaClosing eventType = 0
+	eventTypeSend           eventType = 1
+	eventTypeCommitDelay    eventType = 2
+	eventTypeMsgRecv        eventType = 100
 )
 
 func (e eventType) String() string {
 	switch e {
+	case eventTypeReplicaClosing:
+		return "replica_closing"
 	case eventTypeSend:
 		return "send"
 	case eventTypeCommitDelay:
@@ -94,6 +96,7 @@ type Replica struct {
 	events      chan event
 	connCloseWg sync.WaitGroup
 	closing     chan struct{}
+	closed      chan struct{}
 	createConn  func(toAddr string) (net.Conn, error)
 	envelopeIdR *rand.Rand
 
@@ -129,6 +132,7 @@ func NewReplica(
 		clientConns:       make(map[uint64]net.Conn),
 		events:            make(chan event, 1000),
 		closing:           make(chan struct{}),
+		closed:            make(chan struct{}),
 		createConn:        createConn,
 		envelopeIdR:       r,
 		viewId:            0,
@@ -147,6 +151,7 @@ func NewReplica(
 	return replica
 }
 
+// GetState get the replica state to compare with another state
 func (r *Replica) GetState() string {
 	h := sha256.New()
 	for i := range r.logs {
@@ -190,16 +195,20 @@ func (r *Replica) Accept(conn net.Conn) {
 // Close closes the handler and all its states
 func (r *Replica) Close() error {
 	close(r.closing)
-	close(r.events)
+	r.events <- event{etype: eventTypeReplicaClosing}
 	r.connCloseWg.Wait()
 	clear(r.clientConns)
+	<-r.closed
 	return nil
 }
 
 func (r *Replica) loop() {
+EventLoop:
 	for e := range r.events {
 		// fmt.Printf("Event %s\n", e.String())
 		switch e.etype {
+		case eventTypeReplicaClosing:
+			break EventLoop
 		case eventTypeSend:
 			r.handleSend(e.nodeId, e.envelope)
 		case eventTypeCommitDelay:
@@ -210,6 +219,7 @@ func (r *Replica) loop() {
 			assert.Assertf(false, "Unknown event type %d", e.etype)
 		}
 	}
+	close(r.closed)
 }
 
 func (r *Replica) newEnvelope(cmd CmdType, payload any) *Envelope {
