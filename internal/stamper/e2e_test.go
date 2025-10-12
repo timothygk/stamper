@@ -3,6 +3,7 @@ package stamper_test
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -103,40 +104,38 @@ type network struct {
 }
 
 func (n *network) propagate() {
-	// type ToSend struct {
-	// 	conn *conn
-	// 	cnt  int
-	// }
+	type ToSend struct {
+		conn *conn
+		cnt  int
+	}
 
-	// tosend := []ToSend{}
+	tosend := []ToSend{}
 	for _, conn := range n.conns {
 		if len(conn.queue) == 0 {
 			continue
 		}
 		numToSend := n.r.IntN(len(conn.queue) + 1)
-		// if numToSend > 0 {
-		// 	tosend = append(tosend, ToSend{conn, numToSend})
-		// }
-		for range numToSend {
-			conn.deliverOne()
-			synctest.Wait()
+		if numToSend > 0 {
+			tosend = append(tosend, ToSend{conn, numToSend})
 		}
 	}
 
 	// shuffled delivery
-	// for len(tosend) > 0 {
-	// 	i := n.r.IntN(len(tosend))
-	// 	tosend[i].conn.deliverOne()
-	// 	synctest.Wait() // wait until receiver goroutine finished
-	// 	tosend[i].cnt--
-	// 	if tosend[i].cnt == 0 {
-	// 		lastIdx := len(tosend) - 1
-	// 		if i != lastIdx {
-	// 			tosend[i], tosend[lastIdx] = tosend[lastIdx], tosend[i]
-	// 		}
-	// 		tosend = tosend[:lastIdx]
-	// 	}
-	// }
+	for len(tosend) > 0 {
+		// pick one to send the network request
+		i := n.r.IntN(len(tosend))
+		tosend[i].conn.deliverOne()
+		synctest.Wait()
+		// decr counter & cleanup if needed
+		tosend[i].cnt--
+		if tosend[i].cnt == 0 {
+			lastIdx := len(tosend) - 1
+			if i != lastIdx {
+				tosend[i], tosend[lastIdx] = tosend[lastIdx], tosend[i]
+			}
+			tosend = tosend[:lastIdx]
+		}
+	}
 }
 
 func (n *network) createConnFunc(srcAddr string) func(string) (net.Conn, error) {
@@ -165,23 +164,33 @@ func (n *network) createConnFunc(srcAddr string) func(string) (net.Conn, error) 
 	}
 }
 
+func iotaWithPrefix(prefix string, num int, start int) []string {
+	result := make([]string, 0, num)
+	for i := range num {
+		result = append(result, fmt.Sprintf("%s-%d", prefix, start+i))
+	}
+	return result
+}
+
 func simulate(t *testing.T) {
-	const numTicks = 10
-	const requestPerTick = 2
+	const numServers = 3
+	const numClients = 10
+	const numTicks = 1000
+	const requestPerTick = 25
 	r := rand.New(rand.NewPCG(123, 456))
-	clientR := rand.New(rand.NewPCG(r.Uint64(), rand.Uint64()))
+	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
 
 	logging.Logf("Start simulation at %v\n", time.Now())
 
 	// init
 	n := network{
 		r:           rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
-		serverAddrs: []string{"server0", "server1", "server2"},
-		clientAddrs: []string{"client0", "client1", "client2", "client3"},
+		serverAddrs: iotaWithPrefix("server", numServers, 0),
+		clientAddrs: iotaWithPrefix("client", numClients, 0),
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	for i := range n.replicas {
-		replicaR := rand.New(rand.NewPCG(r.Uint64(), rand.Uint64()))
+		replicaR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
 		n.replicas[i] = initReplica(n.serverAddrs, i, replicaR, n.createConnFunc(n.serverAddrs[i]))
 		synctest.Wait()
 	}
@@ -193,7 +202,6 @@ func simulate(t *testing.T) {
 
 	// main loop
 	for range numTicks {
-
 		// generate requests
 		for range requestPerTick {
 			index := clientR.IntN(len(n.clients))
@@ -208,7 +216,6 @@ func simulate(t *testing.T) {
 			}()
 			synctest.Wait()
 		}
-
 		n.propagate()                     // propagate network
 		time.Sleep(10 * time.Millisecond) // move time by 10ms
 	}

@@ -116,11 +116,11 @@ func NewClient(
 }
 
 func (c *Client) Close() error {
-	logging.Logf("[Client %d] closing...\n", c.config.ClientId)
+	// logging.Logf("[Client %d] closing...\n", c.config.ClientId)
 	close(c.closing)
 	c.events <- event{etype: eventTypeClientClosing}
 	<-c.closed
-	logging.Logf("[Client %d] closed...\n", c.config.ClientId)
+	// logging.Logf("[Client %d] closed...\n", c.config.ClientId)
 	return nil
 }
 
