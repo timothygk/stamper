@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+
+	"github.com/timothygk/stamper/internal/assert"
 )
 
 type JsonEncoderDecoder struct{}
 
 func (JsonEncoderDecoder) Encode(w io.Writer, msg *Envelope) error {
-	if msg == nil {
-		return json.NewEncoder(w).Encode(nil)
-	}
+	assert.Assert(msg != nil, "Should not have nil msg")
 	return json.NewEncoder(w).Encode(struct {
 		Cmd        CmdType `json:"cmd"`
 		EnvelopeId uint64  `json:"envelope_id"`

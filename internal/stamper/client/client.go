@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync/atomic"
 	"time"
 
 	"github.com/timothygk/stamper/internal/assert"
+	"github.com/timothygk/stamper/internal/logging"
 	"github.com/timothygk/stamper/internal/stamper"
 	"github.com/timothygk/stamper/internal/timepkg"
 )
@@ -64,7 +64,10 @@ func (e *event) String() string {
 	)
 }
 
-var ErrAnotherRequestInflight = errors.New("there's another request inflight")
+var (
+	ErrAnotherRequestInflight = errors.New("there's another request inflight")
+	ErrClientClosed           = errors.New("client closed")
+)
 
 type ClientConfig struct {
 	ClientId      uint64
@@ -113,9 +116,11 @@ func NewClient(
 }
 
 func (c *Client) Close() error {
+	logging.Logf("[Client %d] closing...\n", c.config.ClientId)
 	close(c.closing)
 	c.events <- event{etype: eventTypeClientClosing}
 	<-c.closed
+	logging.Logf("[Client %d] closed...\n", c.config.ClientId)
 	return nil
 }
 
@@ -164,12 +169,13 @@ func (c *Client) Request(body []byte) ([]byte, error) {
 			}
 			return reply.ResponseBody, nil
 		case <-c.closing:
-			return nil, io.EOF
+			return nil, ErrClientClosed
 		}
 	}
 }
 
 func (c *Client) loop() {
+	logging.Logf("[Client %d] start loop...\n", c.config.ClientId)
 EventLoop:
 	for e := range c.events {
 		// fmt.Printf("Event %s\n", e.String())
@@ -255,6 +261,7 @@ func (c *Client) listen(serverIdx int, conn net.Conn) {
 				// TODO: log
 				return
 			}
+			// logging.Logf("Client recv from server %d, conn: %p, msg: %s\n", serverIdx, conn, envelope.JsonStr())
 			c.events <- event{
 				etype:        eventTypeRecv,
 				serverIdx:    serverIdx,
