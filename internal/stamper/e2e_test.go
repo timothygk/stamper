@@ -193,8 +193,6 @@ func simulate(t *testing.T) {
 
 	// main loop
 	for range numTicks {
-		// propagate network requests
-		n.propagate()
 
 		// generate requests
 		for range requestPerTick {
@@ -210,10 +208,15 @@ func simulate(t *testing.T) {
 			}()
 			synctest.Wait()
 		}
+
+		n.propagate()                     // propagate network
+		time.Sleep(10 * time.Millisecond) // move time by 10ms
 	}
 
+	// extra loops to propagate background timers..
 	for range 1000 {
-		n.propagate()
+		n.propagate()                      // propagate network
+		time.Sleep(300 * time.Millisecond) // move time by 300ms
 	}
 
 	for i, r := range n.replicas {
