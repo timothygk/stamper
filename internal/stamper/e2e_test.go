@@ -22,6 +22,15 @@ func TestSimulation(t *testing.T) {
 	synctest.Test(t, simulate)
 }
 
+type Fraction struct {
+	Numerator   uint64
+	Denominator uint64
+}
+
+func flipCoin(r *rand.Rand, prob Fraction) bool {
+	return r.Uint64N(prob.Denominator) < prob.Numerator
+}
+
 func initReplica(addrs []string, nodeId int, r *rand.Rand, createConn func(string) (net.Conn, error)) *stamper.Replica {
 	config := stamper.ReplicaConfig{
 		SendRetryDuration:   3 * time.Second,
@@ -56,13 +65,17 @@ func initClient(serverAddrs []string, clientId uint64, createConn func(string) (
 
 type conn struct {
 	net.Conn
+	srcIdx int
+	dstIdx int
 	queue  [][]byte
 	closed bool
 }
 
-func newConn(pipeConn net.Conn) *conn {
+func newConn(pipeConn net.Conn, srcIdx, dstIdx int) *conn {
 	return &conn{
 		Conn:   pipeConn,
+		srcIdx: srcIdx,
+		dstIdx: dstIdx,
 		closed: false,
 	}
 }
@@ -101,6 +114,32 @@ type network struct {
 	clientAddrs []string
 	clients     []*client.Client
 	conns       []*conn
+	// network partition
+	serverCutOff []time.Time
+	cutOffProb   Fraction
+	cutOffMin    time.Duration
+	cutOffMax    time.Duration
+}
+
+func (n *network) isPartitioned(idx int) bool {
+	if idx >= len(n.serverAddrs) {
+		return false
+	}
+	return n.serverCutOff[idx].After(time.Now())
+}
+
+func (n *network) partition() {
+	numPartitioned := 0
+	for i := range n.serverCutOff {
+		if n.isPartitioned(i) {
+			numPartitioned++
+		}
+	}
+	if numPartitioned*2+1 < len(n.serverAddrs) && flipCoin(n.r, n.cutOffProb) {
+		serverId := n.r.IntN(len(n.serverAddrs))
+		dur := time.Duration(n.r.Int64N(int64(n.cutOffMax-n.cutOffMin))) + n.cutOffMin
+		n.serverCutOff[serverId] = time.Now().Add(dur)
+	}
 }
 
 func (n *network) propagate() {
@@ -111,7 +150,15 @@ func (n *network) propagate() {
 
 	tosend := []ToSend{}
 	for _, conn := range n.conns {
+		if conn.closed {
+			continue
+		}
 		if len(conn.queue) == 0 {
+			continue
+		}
+		if n.isPartitioned(conn.dstIdx) {
+			conn.Close()
+			synctest.Wait()
 			continue
 		}
 		numToSend := n.r.IntN(len(conn.queue) + 1)
@@ -139,21 +186,41 @@ func (n *network) propagate() {
 }
 
 func (n *network) createConnFunc(srcAddr string) func(string) (net.Conn, error) {
+	srcIdx := -1
+	for i, addr := range n.serverAddrs {
+		if addr == srcAddr {
+			srcIdx = i
+			break
+		}
+	}
+	if srcIdx == -1 {
+		for i, addr := range n.clientAddrs {
+			if addr == srcAddr {
+				srcIdx = i + len(n.serverAddrs)
+				break
+			}
+		}
+	}
+	assert.Assertf(srcIdx >= 0, "Unknown srcAddr:%s", srcAddr)
 	return func(dstAddr string) (net.Conn, error) {
-		dstReplicaIdx := -1
+		dstIdx := -1
 		for i, addr := range n.serverAddrs {
 			if addr == dstAddr {
-				dstReplicaIdx = i
+				dstIdx = i
 				break
 			}
 		}
 
-		assert.Assertf(dstReplicaIdx >= 0, "Unknown dstAddr:%s from srcAddr:%s", dstAddr, srcAddr)
+		assert.Assertf(dstIdx >= 0, "Unknown dstAddr:%s from srcAddr:%s", dstAddr, srcAddr)
+
+		if n.isPartitioned(dstIdx) {
+			return nil, io.EOF
+		}
 
 		src, dst := net.Pipe()
-		cconn := newConn(src)
-		sconn := newConn(dst)
-		n.replicas[dstReplicaIdx].Accept(sconn)
+		cconn := newConn(src, srcIdx, dstIdx)
+		sconn := newConn(dst, dstIdx, srcIdx)
+		n.replicas[dstIdx].Accept(sconn)
 		n.conns = append(n.conns, cconn)
 		n.conns = append(n.conns, sconn)
 		// logging.Logf("Create conn src: (%s, %p, %p, %p) dst: (%s, %p, %p, %p)\n",
@@ -174,9 +241,9 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 
 func simulate(t *testing.T) {
 	const numServers = 3
-	const numClients = 10
-	const numTicks = 1000
-	const requestPerTick = 25
+	const numClients = 1
+	const numTicks = 30
+	const requestPerTick = 1
 	r := rand.New(rand.NewPCG(123, 456))
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
 
@@ -184,9 +251,13 @@ func simulate(t *testing.T) {
 
 	// init
 	n := network{
-		r:           rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
-		serverAddrs: iotaWithPrefix("server", numServers, 0),
-		clientAddrs: iotaWithPrefix("client", numClients, 0),
+		r:            rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
+		serverAddrs:  iotaWithPrefix("server", numServers, 0),
+		clientAddrs:  iotaWithPrefix("client", numClients, 0),
+		serverCutOff: make([]time.Time, numServers),
+		cutOffProb:   Fraction{99, 100},
+		cutOffMin:    time.Second,
+		cutOffMax:    3 * time.Second,
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	for i := range n.replicas {
@@ -216,14 +287,15 @@ func simulate(t *testing.T) {
 			}()
 			synctest.Wait()
 		}
-		n.propagate()                     // propagate network
-		time.Sleep(10 * time.Millisecond) // move time by 10ms
+		n.partition()                      // network partition
+		n.propagate()                      // propagate network messages
+		time.Sleep(100 * time.Millisecond) // move time
 	}
 
 	// extra loops to propagate background timers..
 	for range 1000 {
 		n.propagate()                      // propagate network
-		time.Sleep(300 * time.Millisecond) // move time by 300ms
+		time.Sleep(300 * time.Millisecond) // move time
 	}
 
 	for i, r := range n.replicas {
