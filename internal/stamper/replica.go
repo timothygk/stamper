@@ -41,7 +41,7 @@ const (
 	eventTypeConnAccepted    eventType = 1
 	eventTypeConnClosed      eventType = 2
 	eventTypeSend            eventType = 3
-	eventTypeCommitDelay     eventType = 4
+	eventTypeHeartbeatCommit eventType = 4
 	eventTypeViewChangeTimer eventType = 5
 	eventTypeMsgRecv         eventType = 100
 )
@@ -56,7 +56,7 @@ func (e eventType) String() string {
 		return "conn_closed"
 	case eventTypeSend:
 		return "send"
-	case eventTypeCommitDelay:
+	case eventTypeHeartbeatCommit:
 		return "commit_delay"
 	case eventTypeViewChangeTimer:
 		return "view_change_timer"
@@ -126,7 +126,7 @@ type Replica struct {
 	waitAck           map[uint64]struct{} // set of envelopeId
 	waitingPrepares   map[uint64]*Prepare // logId -> prepare request
 	lastPreparedLogId []uint64            // node -> last prepared log id
-	maxSentCommitId   uint64
+	lastCommitAt      time.Time           // last commit time
 	viewChangeTimer   timepkg.Timer
 }
 
@@ -162,8 +162,8 @@ func NewReplica(
 		waitAck:           make(map[uint64]struct{}),
 		waitingPrepares:   make(map[uint64]*Prepare),
 		lastPreparedLogId: make([]uint64, len(config.ServerAddrs)),
-		maxSentCommitId:   0,
 	}
+	go replica.heartbeatLoop()
 	go replica.loop()
 	return replica
 }
@@ -202,6 +202,21 @@ func (r *Replica) Close() error {
 	<-r.closed
 	logging.Logf("[Node %d] closed...\n", r.config.NodeId)
 	return nil
+}
+
+func (r *Replica) heartbeatLoop() {
+	ticker := r.tt.Tick(r.config.CommitDelayDuration)
+	for {
+		select {
+		case <-ticker:
+			r.events <- event{
+				etype:    eventTypeHeartbeatCommit,
+				commitId: 0,
+			}
+		case <-r.closing:
+			return
+		}
+	}
 }
 
 func (r *Replica) loop() {
@@ -252,8 +267,8 @@ EventLoop:
 			}
 		case eventTypeSend:
 			r.handleSend(e.targetNodeId, e.envelope)
-		case eventTypeCommitDelay:
-			r.handleCommitDelay(e.commitId)
+		case eventTypeHeartbeatCommit:
+			r.handleHeartbeatCommit()
 		case eventTypeViewChangeTimer:
 			r.handleViewChangeTimer()
 		case eventTypeMsgRecv:
@@ -376,13 +391,12 @@ func (r *Replica) handleSend(targetNodeId int, envelope *Envelope) {
 	}
 }
 
-func (r *Replica) handleCommitDelay(commitId uint64) {
-	assert.Assert(commitId <= r.commitId, "On commit, the src commit id should be before or equal to current commit id")
-
-	// TODO: convert this as heartbeat
-
-	if r.maxSentCommitId >= commitId {
-		return
+func (r *Replica) handleHeartbeatCommit() {
+	if r.primaryNode() != r.config.NodeId {
+		return // skip if this is not the primary node
+	}
+	if r.lastCommitAt.Add(r.config.CommitDelayDuration).After(r.tt.Now()) {
+		return // skip, there's a recent heartbeat
 	}
 
 	// broadcast the latest commit rather than the requested commit id
@@ -390,7 +404,7 @@ func (r *Replica) handleCommitDelay(commitId uint64) {
 		ViewId:   r.viewId,
 		CommitId: r.commitId,
 	})
-	r.maxSentCommitId = r.commitId
+	r.lastCommitAt = r.tt.Now()
 }
 
 func (r *Replica) handleViewChangeTimer() {
@@ -519,9 +533,7 @@ func (r *Replica) handleRequest(request *Request) {
 		CommitId:      r.commitId,
 		ClientRequest: request,
 	})
-	if r.maxSentCommitId < r.commitId {
-		r.maxSentCommitId = r.commitId // commitId is piggybacked on prepare msg
-	}
+	r.lastCommitAt = r.tt.Now()
 }
 
 func (r *Replica) handlePrepare(prepare *Prepare) {
@@ -570,10 +582,7 @@ func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) {
 	toCommitId := r.quorumAddPrepareOk(prepareOk.LogId, prepareOk.NodeId)
 	r.doCommit(toCommitId, true)
 	r.tt.AfterFunc(r.config.CommitDelayDuration, func() {
-		r.events <- event{
-			etype:    eventTypeCommitDelay,
-			commitId: r.commitId,
-		}
+		r.events <- event{etype: eventTypeHeartbeatCommit}
 	})
 }
 

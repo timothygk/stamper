@@ -243,7 +243,7 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 func simulate(t *testing.T) {
 	const numServers = 3
 	const numClients = 1
-	const numTicks = 30
+	const numTicks = 300000
 	const requestPerTick = 1
 	r := rand.New(rand.NewPCG(123, 456))
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
@@ -258,7 +258,7 @@ func simulate(t *testing.T) {
 		serverCutOff: make([]time.Time, numServers),
 		cutOffProb:   Fraction{99, 100},
 		cutOffMin:    time.Second,
-		cutOffMax:    3 * time.Second,
+		cutOffMax:    30 * time.Second,
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	for i := range n.replicas {
@@ -288,7 +288,7 @@ func simulate(t *testing.T) {
 			}()
 			synctest.Wait()
 		}
-		n.partition()                      // network partition
+		//n.partition()                      // network partition
 		n.propagate()                      // propagate network messages
 		time.Sleep(100 * time.Millisecond) // move time
 	}

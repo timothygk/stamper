@@ -12,6 +12,7 @@ type Timer interface {
 
 // Time the main time interface
 type Time interface {
+	Now() time.Time
 	AfterFunc(d time.Duration, f func()) Timer
 	Tick(d time.Duration) <-chan time.Time
 }
@@ -22,6 +23,10 @@ func NewTime() Time {
 }
 
 type realTimePkg struct{}
+
+func (realTimePkg) Now() time.Time {
+	return time.Now()
+}
 
 func (realTimePkg) AfterFunc(d time.Duration, f func()) Timer {
 	return time.AfterFunc(d, f)
