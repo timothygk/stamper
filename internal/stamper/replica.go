@@ -127,7 +127,10 @@ type Replica struct {
 	waitingPrepares   map[uint64]*Prepare // logId -> prepare request
 	lastPreparedLogId []uint64            // node -> last prepared log id
 	lastCommitAt      time.Time           // last commit time
+	lastNormalViewId  uint64
+	lastChangedViewId []uint64 // last view change id
 	viewChangeTimer   timepkg.Timer
+	doViewChangeSet   map[uint64]map[int]*DoViewChange // viewId -> {nodeId -> doViewChange}
 }
 
 // NewReplica create a new replica
@@ -162,6 +165,8 @@ func NewReplica(
 		waitAck:           make(map[uint64]struct{}),
 		waitingPrepares:   make(map[uint64]*Prepare),
 		lastPreparedLogId: make([]uint64, len(config.ServerAddrs)),
+		lastNormalViewId:  0,
+		lastChangedViewId: make([]uint64, len(config.ServerAddrs)),
 	}
 	go replica.heartbeatLoop()
 	go replica.loop()
@@ -334,6 +339,8 @@ func (r *Replica) sendReply(clientId uint64, reply *Reply) {
 }
 
 func (r *Replica) sendTo(targetNodeId int, cmd CmdType, payload any) {
+	assert.Assertf(targetNodeId != r.config.NodeId, "Should not send to self, cmd:%s", cmd.String())
+
 	// create envlope & wait for ack
 	envelope := r.newEnvelope(cmd, payload)
 	r.waitAck[envelope.EnvelopeId] = struct{}{}
@@ -417,9 +424,14 @@ func (r *Replica) handleViewChangeTimer() {
 	if r.status != replicaStatusNormal {
 		return
 	}
+	r.initViewChange(r.viewId + 1)
+	toViewId := r.quorumAddStartViewChange(r.viewId, r.config.NodeId)
+	assert.Assert(toViewId < r.viewId, "First view change timer should not have F replies from other replicas")
+}
 
+func (r *Replica) initViewChange(viewId uint64) {
 	r.status = replicaStatusViewChange
-	r.viewId++
+	r.viewId = viewId
 	r.broadcast(CmdTypeStartViewChange, &StartViewChange{
 		ViewId: r.viewId,
 		NodeId: r.config.NodeId,
@@ -450,6 +462,18 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 		commit, ok := envelope.Payload.(*Commit)
 		assert.Assert(ok, "should be able to cast envelope payload to *Commit type")
 		r.handleCommit(commit)
+	case CmdTypeStartViewChange:
+		startViewChange, ok := envelope.Payload.(*StartViewChange)
+		assert.Assert(ok, "should be able to cast envelope payload to *StartViewChange type")
+		r.handleStartViewChange(startViewChange)
+	case CmdTypeDoViewChange:
+		doViewChange, ok := envelope.Payload.(*DoViewChange)
+		assert.Assert(ok, "should be able to cast envelope payload to *DoViewChange type")
+		r.handleDoViewChange(doViewChange)
+	case CmdTypeStartView:
+		startView, ok := envelope.Payload.(*StartView)
+		assert.Assert(ok, "should be able to cast envelope payload to *StartView type")
+		r.handleStartView(startView)
 	case CmdTypeAck:
 		ack, ok := envelope.Payload.(*Ack)
 		assert.Assert(ok, "should be able to cast envelope payload to *Ack type")
@@ -539,6 +563,12 @@ func (r *Replica) handleRequest(request *Request) {
 func (r *Replica) handlePrepare(prepare *Prepare) {
 	assert.Assert(prepare != nil, "prepare should not be nil")
 
+	if r.status != replicaStatusNormal {
+		return // replica in view change or recovery mode
+	}
+	if !r.validateViewId(prepare.ViewId, false) {
+		return
+	}
 	if r.lastLogId >= prepare.LogId {
 		// already existed
 		return
@@ -575,6 +605,12 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) {
 	assert.Assert(prepareOk != nil, "prepareOk should not be nil")
 
+	if r.status != replicaStatusNormal {
+		return // replica in view change or recovery mode
+	}
+	if !r.validateViewId(prepareOk.ViewId, true) {
+		return
+	}
 	if r.commitId >= prepareOk.LogId {
 		return // committed, skip this log id
 	}
@@ -589,7 +625,176 @@ func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) {
 func (r *Replica) handleCommit(commit *Commit) {
 	assert.Assert(commit != nil, "commit should not be nil")
 
+	if r.status != replicaStatusNormal {
+		return // replica in view change or recovery mode
+	}
+	if !r.validateViewId(commit.ViewId, false) {
+		return
+	}
+
 	r.doCommit(commit.CommitId, false)
+}
+
+func (r *Replica) handleStartViewChange(startViewChange *StartViewChange) {
+	assert.Assert(startViewChange != nil, "startViewChange should not be nil")
+
+	initialViewId := r.viewId
+	if startViewChange.ViewId > r.viewId {
+		// trigger view change
+		r.initViewChange(startViewChange.ViewId)
+		r.quorumAddStartViewChange(startViewChange.ViewId, r.config.NodeId)
+	}
+
+	toViewId := r.quorumAddStartViewChange(startViewChange.ViewId, startViewChange.NodeId)
+	if toViewId > initialViewId {
+		nextPrimaryId := int(toViewId % uint64(len(r.config.ServerAddrs)))
+		doViewChange := &DoViewChange{
+			ViewId:           toViewId,
+			LastNormalViewId: r.lastNormalViewId,
+			LastLogId:        r.lastLogId,
+			CommitId:         r.commitId,
+			NodeId:           r.config.NodeId,
+		}
+		if nextPrimaryId == r.config.NodeId {
+			r.handleDoViewChange(doViewChange)
+		} else {
+			// copy logs
+			doViewChange.Logs = make([]RequestLog, len(r.logs))
+			for i := range r.logs {
+				doViewChange.Logs[i].ClientId = r.logs[i].ClientId
+				doViewChange.Logs[i].RequestId = r.logs[i].RequestId
+				doViewChange.Logs[i].LogId = r.logs[i].LogId
+				doViewChange.Logs[i].Body = r.logs[i].Body
+			}
+			r.sendTo(nextPrimaryId, CmdTypeDoViewChange, doViewChange)
+		}
+	}
+}
+
+func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
+	assert.Assert(doViewChange != nil, "doViewChange should not be nil")
+	assert.Assertf(
+		int(doViewChange.ViewId%uint64(len(r.config.ServerAddrs))) == r.config.NodeId,
+		"DoViewChange sent to a wrong node, doViewChange.ViewId=%d, nodeId=%d",
+		doViewChange.ViewId,
+		r.config.NodeId,
+	)
+
+	if doViewChange.ViewId < r.viewId {
+		return // skip if incoming view id is outdated
+	}
+	if doViewChange.ViewId == r.viewId && r.status == replicaStatusNormal {
+		return // skip if view id matched
+	}
+	if doViewChange.ViewId > r.viewId {
+		// transition state to view change mode
+		r.initViewChange(doViewChange.ViewId)
+		r.quorumAddStartViewChange(doViewChange.ViewId, r.config.NodeId)
+	}
+
+	// add value to the set
+	set, ok := r.doViewChangeSet[doViewChange.ViewId]
+	if !ok {
+		set = make(map[int]*DoViewChange)
+		r.doViewChangeSet[doViewChange.ViewId] = set
+	}
+	set[doViewChange.NodeId] = doViewChange
+
+	// quorum check
+	if threshold := (len(r.config.ServerAddrs))/2 + 1; len(set) >= threshold {
+		var best *DoViewChange
+		bestCommitId := uint64(0)
+		for _, current := range set {
+			if best == nil ||
+				best.LastNormalViewId < current.LastNormalViewId ||
+				best.LastNormalViewId == current.LastNormalViewId && best.LastLogId < current.LastLogId {
+				best = current
+			}
+			if bestCommitId > current.CommitId {
+				bestCommitId = current.CommitId
+			}
+		}
+		// update state
+		r.replaceState(best.ViewId, best.LastLogId, best.CommitId, best.Logs, best.NodeId == r.config.NodeId)
+		if r.lastLogId > r.commitId {
+			r.quorumAddPrepareOk(r.lastLogId, r.config.NodeId)
+		}
+		// broadcast start view
+		r.broadcast(CmdTypeStartView, &StartView{
+			ViewId:    best.ViewId,
+			Logs:      best.Logs,
+			LastLogId: best.LastLogId,
+			CommitId:  best.CommitId,
+		})
+	}
+}
+
+func (r *Replica) handleStartView(startView *StartView) {
+	assert.Assert(startView != nil, "startView should not be nil")
+	assert.Assertf(
+		int(startView.ViewId%uint64(len(r.config.ServerAddrs))) != r.config.NodeId,
+		"StartView sent to a primary node, startView.ViewId=%d, nodeId=%d",
+		startView.ViewId,
+		r.config.NodeId,
+	)
+
+	if startView.ViewId < r.viewId || startView.ViewId == r.viewId && r.status == replicaStatusNormal {
+		return
+	}
+
+	// update state
+	r.replaceState(startView.ViewId, startView.LastLogId, startView.CommitId, startView.Logs, false)
+	// send prepareOk
+	if r.lastLogId > r.commitId {
+		primaryNodeId := r.primaryNode()
+		r.sendTo(primaryNodeId, CmdTypePrepareOk, &PrepareOk{
+			ViewId: r.viewId,
+			LogId:  r.lastLogId,
+			NodeId: r.config.NodeId,
+		})
+	}
+}
+
+func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []RequestLog, sameNode bool) {
+	r.viewId = viewId
+	r.lastNormalViewId = viewId
+	r.lastLogId = lastLogId
+
+	if !sameNode {
+		// copy logs
+		for i := range logs {
+			r.logs[i].ClientId = logs[i].ClientId
+			r.logs[i].RequestId = logs[i].RequestId
+			r.logs[i].LogId = logs[i].LogId
+			r.logs[i].Body = logs[i].Body
+		}
+	}
+
+	// commit
+	r.doCommit(commitId, false)
+
+	// clear internal states
+	clear(r.waitingPrepares)
+	for viewId := range r.doViewChangeSet {
+		if viewId <= r.viewId {
+			delete(r.doViewChangeSet, viewId)
+		}
+	}
+
+	// update client table
+	for logId := r.commitId + 1; logId <= r.lastLogId; logId++ {
+		index := logId - 1
+		assert.Assertf(r.logs[index].LogId == logId, "Logs array should be ordered correctly, expected %d, found %d", logId, r.logs[index].LogId)
+		r.clients[r.logs[index].ClientId] = &clientTable{
+			requestId: r.logs[index].RequestId,
+			reply:     nil,
+		}
+	}
+	r.status = replicaStatusNormal
+}
+
+func (r *Replica) validateViewId(viewId uint64, shouldBePrimary bool) bool {
+	return viewId == r.viewId && shouldBePrimary == (r.primaryNode() == r.config.NodeId)
 }
 
 func (r *Replica) primaryNode() int {
@@ -643,4 +848,17 @@ func (r *Replica) doCommit(toCommitId uint64, sendReply bool) {
 			r.sendReply(r.logs[index].ClientId, reply)
 		}
 	}
+}
+
+func (r *Replica) quorumAddStartViewChange(viewId uint64, nodeId int) uint64 {
+	if r.lastChangedViewId[nodeId] < viewId {
+		r.lastChangedViewId[nodeId] = viewId
+	}
+
+	viewIds := make([]uint64, 0, len(r.lastChangedViewId))
+	viewIds = append(viewIds, r.lastChangedViewId...)
+	sort.Slice(viewIds, func(i, j int) bool { return viewIds[i] > viewIds[j] }) // desc
+
+	threshold := (len(r.config.ServerAddrs))/2 + 1
+	return viewIds[threshold-1]
 }
