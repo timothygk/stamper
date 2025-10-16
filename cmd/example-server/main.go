@@ -50,10 +50,11 @@ func main() {
 	now := time.Now()
 	r := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(now.Unix())))
 	config := stamper.ReplicaConfig{
-		SendRetryDuration:   3 * time.Second,
-		CommitDelayDuration: 5 * time.Second,
-		NodeId:              nodeId,
-		ServerAddrs:         addrs,
+		SendRetryDuration:       3 * time.Second,
+		CommitDelayDuration:     5 * time.Second,
+		ViewChangeDelayDuration: 10 * time.Second,
+		NodeId:                  nodeId,
+		ServerAddrs:             addrs,
 	}
 	replica := stamper.NewReplica(
 		config,

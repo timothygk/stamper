@@ -37,12 +37,13 @@ type clientTable struct {
 type eventType int
 
 const (
-	eventTypeReplicaClosing eventType = 0
-	eventTypeConnAccepted   eventType = 1
-	eventTypeConnClosed     eventType = 2
-	eventTypeSend           eventType = 3
-	eventTypeCommitDelay    eventType = 4
-	eventTypeMsgRecv        eventType = 100
+	eventTypeReplicaClosing  eventType = 0
+	eventTypeConnAccepted    eventType = 1
+	eventTypeConnClosed      eventType = 2
+	eventTypeSend            eventType = 3
+	eventTypeCommitDelay     eventType = 4
+	eventTypeViewChangeTimer eventType = 5
+	eventTypeMsgRecv         eventType = 100
 )
 
 func (e eventType) String() string {
@@ -57,6 +58,8 @@ func (e eventType) String() string {
 		return "send"
 	case eventTypeCommitDelay:
 		return "commit_delay"
+	case eventTypeViewChangeTimer:
+		return "view_change_timer"
 	case eventTypeMsgRecv:
 		return "msg_recv"
 	default:
@@ -84,10 +87,11 @@ func (e *event) String() string {
 }
 
 type ReplicaConfig struct {
-	SendRetryDuration   time.Duration
-	CommitDelayDuration time.Duration
-	NodeId              int
-	ServerAddrs         []string // configurations, currently it is static
+	SendRetryDuration       time.Duration
+	CommitDelayDuration     time.Duration
+	ViewChangeDelayDuration time.Duration
+	NodeId                  int
+	ServerAddrs             []string // configurations, currently it is static
 }
 
 type Replica struct {
@@ -123,6 +127,7 @@ type Replica struct {
 	waitingPrepares   map[uint64]*Prepare // logId -> prepare request
 	lastPreparedLogId []uint64            // node -> last prepared log id
 	maxSentCommitId   uint64
+	viewChangeTimer   timepkg.Timer
 }
 
 // NewReplica create a new replica
@@ -135,10 +140,10 @@ func NewReplica(
 	upcall func([]byte) []byte,
 ) *Replica {
 	replica := &Replica{
-		config:            config,
-		tt:                tt,
-		encdec:            encdec,
-		createConn:        createConn,
+		config:     config,
+		tt:         tt,
+		encdec:     encdec,
+		createConn: createConn,
 		// TODO: better connection management?
 		conns:             make([]net.Conn, 0, 10),
 		serverConns:       make([]net.Conn, len(config.ServerAddrs)),
@@ -200,6 +205,9 @@ func (r *Replica) Close() error {
 }
 
 func (r *Replica) loop() {
+	r.viewChangeTimer = r.tt.AfterFunc(r.config.ViewChangeDelayDuration, func() {
+		r.events <- event{etype: eventTypeViewChangeTimer}
+	})
 	logging.Logf("[Node %d] start loop...\n", r.config.NodeId)
 EventLoop:
 	for e := range r.events {
@@ -246,6 +254,8 @@ EventLoop:
 			r.handleSend(e.targetNodeId, e.envelope)
 		case eventTypeCommitDelay:
 			r.handleCommitDelay(e.commitId)
+		case eventTypeViewChangeTimer:
+			r.handleViewChangeTimer()
 		case eventTypeMsgRecv:
 			r.handleMsgRecv(e.conn, e.envelope)
 		default:
@@ -287,6 +297,7 @@ func (r *Replica) listen(conn net.Conn, targetNodeId int) {
 func (r *Replica) newEnvelope(cmd CmdType, payload any) *Envelope {
 	return &Envelope{
 		Cmd:        cmd,
+		FromNodeId: r.config.NodeId,
 		EnvelopeId: r.envelopeIdR.Uint64(),
 		Payload:    payload,
 	}
@@ -368,6 +379,8 @@ func (r *Replica) handleSend(targetNodeId int, envelope *Envelope) {
 func (r *Replica) handleCommitDelay(commitId uint64) {
 	assert.Assert(commitId <= r.commitId, "On commit, the src commit id should be before or equal to current commit id")
 
+	// TODO: convert this as heartbeat
+
 	if r.maxSentCommitId >= commitId {
 		return
 	}
@@ -378,6 +391,25 @@ func (r *Replica) handleCommitDelay(commitId uint64) {
 		CommitId: r.commitId,
 	})
 	r.maxSentCommitId = r.commitId
+}
+
+func (r *Replica) handleViewChangeTimer() {
+	// always reset timer
+	defer r.viewChangeTimer.Reset(r.config.ViewChangeDelayDuration)
+
+	if r.config.NodeId == r.primaryNode() { // skip view change if it is the primary node
+		return
+	}
+	if r.status != replicaStatusNormal {
+		return
+	}
+
+	r.status = replicaStatusViewChange
+	r.viewId++
+	r.broadcast(CmdTypeStartViewChange, &StartViewChange{
+		ViewId: r.viewId,
+		NodeId: r.config.NodeId,
+	})
 }
 
 func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
@@ -418,6 +450,12 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 	err := r.encdec.Encode(conn, r.newEnvelope(CmdTypeAck, &Ack{envelope.EnvelopeId}))
 	if err != nil {
 		// TODO: log this error
+	}
+
+	// update view change timer
+	primaryNodeId := r.primaryNode()
+	if primaryNodeId != r.config.NodeId && primaryNodeId == envelope.FromNodeId {
+		r.viewChangeTimer.Reset(r.config.ViewChangeDelayDuration)
 	}
 }
 

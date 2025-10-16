@@ -14,10 +14,12 @@ func (JsonEncoderDecoder) Encode(w io.Writer, msg *Envelope) error {
 	assert.Assert(msg != nil, "Should not have nil msg")
 	return json.NewEncoder(w).Encode(struct {
 		Cmd        CmdType `json:"cmd"`
+		FromNodeId int     `json:"from_node_id"`
 		EnvelopeId uint64  `json:"envelope_id"`
 		Payload    any     `json:"payload"`
 	}{
 		Cmd:        msg.Cmd,
+		FromNodeId: msg.FromNodeId,
 		EnvelopeId: msg.EnvelopeId,
 		Payload:    msg.Payload,
 	})
@@ -26,6 +28,7 @@ func (JsonEncoderDecoder) Encode(w io.Writer, msg *Envelope) error {
 func (JsonEncoderDecoder) Decode(r io.Reader) (*Envelope, error) {
 	msg := struct {
 		Cmd        CmdType         `json:"cmd"`
+		FromNodeId int             `json:"from_node_id"`
 		EnvelopeId uint64          `json:"envelope_id"`
 		Payload    json.RawMessage `json:"payload"`
 	}{}
@@ -37,6 +40,7 @@ func (JsonEncoderDecoder) Decode(r io.Reader) (*Envelope, error) {
 
 	envelope := &Envelope{
 		Cmd:        msg.Cmd,
+		FromNodeId: msg.FromNodeId,
 		EnvelopeId: msg.EnvelopeId,
 	}
 
@@ -79,8 +83,9 @@ func (e *Envelope) JsonStr() string {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "")
-	enc.Encode(map[string]interface{}{
+	enc.Encode(map[string]any{
 		"Cmd":        e.Cmd.String(),
+		"FromNodeId": e.FromNodeId,
 		"EnvelopeId": e.EnvelopeId,
 		"Payload":    e.Payload,
 	})

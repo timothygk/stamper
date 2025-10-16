@@ -33,10 +33,11 @@ func flipCoin(r *rand.Rand, prob Fraction) bool {
 
 func initReplica(addrs []string, nodeId int, r *rand.Rand, createConn func(string) (net.Conn, error)) *stamper.Replica {
 	config := stamper.ReplicaConfig{
-		SendRetryDuration:   3 * time.Second,
-		CommitDelayDuration: 5 * time.Second,
-		NodeId:              nodeId,
-		ServerAddrs:         addrs,
+		SendRetryDuration:       3 * time.Second,
+		CommitDelayDuration:     5 * time.Second,
+		ViewChangeDelayDuration: 10 * time.Second,
+		NodeId:                  nodeId,
+		ServerAddrs:             addrs,
 	}
 	replica := stamper.NewReplica(
 		config,

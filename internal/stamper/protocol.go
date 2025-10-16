@@ -163,6 +163,7 @@ type Ack struct {
 // Envelope the envelope structure used for communications
 type Envelope struct {
 	Cmd        CmdType
+	FromNodeId int
 	EnvelopeId uint64
 	Payload    any
 }

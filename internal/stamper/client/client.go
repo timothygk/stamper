@@ -207,8 +207,9 @@ EventLoop:
 
 			// send through the network
 			err = c.encdec.Encode(conn, &stamper.Envelope{
-				Cmd:     stamper.CmdTypeRequest,
-				Payload: e.request,
+				Cmd:        stamper.CmdTypeRequest,
+				FromNodeId: -1,
+				Payload:    e.request,
 			})
 			if err != nil {
 				// TODO: log
