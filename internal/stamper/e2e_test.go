@@ -7,12 +7,13 @@ import (
 	"io"
 	"math/rand/v2"
 	"net"
+	"reflect"
+	"sort"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/timothygk/stamper/internal/assert"
-	"github.com/timothygk/stamper/internal/logging"
 	"github.com/timothygk/stamper/internal/stamper"
 	"github.com/timothygk/stamper/internal/stamper/client"
 	"github.com/timothygk/stamper/internal/timepkg"
@@ -31,7 +32,7 @@ func flipCoin(r *rand.Rand, prob Fraction) bool {
 	return r.Uint64N(prob.Denominator) < prob.Numerator
 }
 
-func initReplica(addrs []string, nodeId int, r *rand.Rand, createConn func(string) (net.Conn, error)) *stamper.Replica {
+func initReplica(addrs []string, nodeId int, r *rand.Rand, tt timepkg.Time, createConn func(string) (net.Conn, error)) *stamper.Replica {
 	config := stamper.ReplicaConfig{
 		SendRetryDuration:       3 * time.Second,
 		CommitDelayDuration:     5 * time.Second,
@@ -41,7 +42,7 @@ func initReplica(addrs []string, nodeId int, r *rand.Rand, createConn func(strin
 	}
 	replica := stamper.NewReplica(
 		config,
-		timepkg.NewTime(),
+		tt,
 		stamper.JsonEncoderDecoder{},
 		createConn,
 		r,
@@ -50,18 +51,120 @@ func initReplica(addrs []string, nodeId int, r *rand.Rand, createConn func(strin
 	return replica
 }
 
-func initClient(serverAddrs []string, clientId uint64, createConn func(string) (net.Conn, error)) *client.Client {
+func initClient(serverAddrs []string, clientId uint64, tt timepkg.Time, createConn func(string) (net.Conn, error)) *client.Client {
 	return client.NewClient(
 		client.ClientConfig{
 			ServerAddrs:   serverAddrs,
 			ClientId:      clientId,
 			RetryDuration: 5 * time.Second,
 		},
-		timepkg.NewTime(),
+		tt,
 		stamper.JsonEncoderDecoder{},
 		createConn,
 	)
+}
 
+type mockedTimer struct {
+	f        func()
+	id       uint64
+	duration time.Duration
+	stopped  bool
+	invoked  bool
+}
+
+func (t *mockedTimer) Stop() bool {
+	if !t.invoked {
+		t.stopped = true
+		return true
+	}
+	return false
+}
+
+func (t *mockedTimer) Reset(d time.Duration) bool {
+	t.duration = d
+	isDone := t.invoked || t.stopped
+	t.stopped = false
+	t.invoked = false
+	return !isDone
+}
+
+type mockedTime struct {
+	r      *rand.Rand
+	now    time.Time
+	timers []*mockedTimer
+	chans  []chan time.Time
+}
+
+func (t *mockedTime) Now() time.Time {
+	return t.now
+}
+
+func (t *mockedTime) AfterFunc(d time.Duration, f func()) timepkg.Timer {
+	return t.makeTimer(d, f)
+}
+
+func (t *mockedTime) Tick(d time.Duration) <-chan time.Time {
+	ch := make(chan time.Time)
+	var f func()
+	f = func() {
+		// ch <- t.now
+		reflect.ValueOf(ch).TrySend(reflect.ValueOf(t.now))
+		t.makeTimer(d, f)
+	}
+	t.makeTimer(d, f)
+	t.chans = append(t.chans, ch)
+	return ch
+}
+
+func (t *mockedTime) makeTimer(d time.Duration, fn func()) *mockedTimer {
+	timer := &mockedTimer{
+		id:       t.r.Uint64(), // generate random id
+		duration: d,
+		f:        fn,
+		stopped:  false,
+		invoked:  false,
+	}
+	t.timers = append(t.timers, timer)
+	return timer
+}
+
+func (t *mockedTime) advanceTime(d time.Duration) {
+	sort.Slice(t.timers, func(i, j int) bool {
+		// order by (duration, id)
+		return t.timers[i].duration < t.timers[j].duration ||
+			t.timers[i].duration == t.timers[j].duration && t.timers[i].id < t.timers[j].id
+	})
+
+	t.now = t.now.Add(d)
+	for _, timer := range t.timers {
+		timer.duration -= d
+		if timer.duration <= 0 && !timer.stopped {
+			// invoke
+			timer.invoked = true
+			timer.f()
+			synctest.Wait()
+		}
+	}
+
+	// clean up slice
+	lastIndex := len(t.timers) - 1
+	for i := lastIndex; i >= 0; i-- {
+		if t.timers[i].invoked || t.timers[i].stopped {
+			// swap to the back
+			t.timers[i], t.timers[lastIndex] = t.timers[lastIndex], t.timers[i]
+			t.timers[lastIndex] = nil // remove reference
+			lastIndex--
+		}
+	}
+	t.timers = t.timers[:lastIndex+1]
+}
+
+func (t *mockedTime) close() error {
+	for _, ch := range t.chans {
+		// reflect.ValueOf(ch).TryRecv()
+		close(ch)
+	}
+	return nil
 }
 
 type conn struct {
@@ -110,6 +213,7 @@ func (c *conn) deliverOne() {
 
 type network struct {
 	r           *rand.Rand
+	now         func() time.Time
 	serverAddrs []string
 	replicas    []*stamper.Replica
 	clientAddrs []string
@@ -126,7 +230,7 @@ func (n *network) isPartitioned(idx int) bool {
 	if idx >= len(n.serverAddrs) {
 		return false
 	}
-	return n.serverCutOff[idx].After(time.Now())
+	return n.serverCutOff[idx].After(n.now())
 }
 
 func (n *network) partition() {
@@ -139,8 +243,11 @@ func (n *network) partition() {
 	if numPartitioned*2+1 < len(n.serverAddrs) && flipCoin(n.r, n.cutOffProb) {
 		serverId := n.r.IntN(len(n.serverAddrs))
 		dur := time.Duration(n.r.Int64N(int64(n.cutOffMax-n.cutOffMin))) + n.cutOffMin
-		n.serverCutOff[serverId] = time.Now().Add(dur)
+		n.serverCutOff[serverId] = n.now().Add(dur)
+		numPartitioned++
 	}
+
+	assert.Assertf(numPartitioned*2+1 <= len(n.serverAddrs), "Partition constrain breached, num:%d total:%d", numPartitioned, len(n.serverAddrs))
 }
 
 func (n *network) propagate() {
@@ -243,36 +350,40 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 func simulate(t *testing.T) {
 	const numServers = 3
 	const numClients = 1
-	const numTicks = 300000
+	const numTicks = 30000
 	const requestPerTick = 1
 	r := rand.New(rand.NewPCG(123, 456))
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
 
-	logging.Logf("Start simulation at %v\n", time.Now())
-
 	// init
+	tt := mockedTime{
+		r:   rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
+		now: time.Now(), // deterministic
+	}
 	n := network{
 		r:            rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
+		now:          tt.Now,
 		serverAddrs:  iotaWithPrefix("server", numServers, 0),
 		clientAddrs:  iotaWithPrefix("client", numClients, 0),
 		serverCutOff: make([]time.Time, numServers),
-		cutOffProb:   Fraction{99, 100},
+		cutOffProb:   Fraction{35, 10000},
 		cutOffMin:    time.Second,
-		cutOffMax:    30 * time.Second,
+		cutOffMax:    15 * time.Second,
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	for i := range n.replicas {
 		replicaR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
-		n.replicas[i] = initReplica(n.serverAddrs, i, replicaR, n.createConnFunc(n.serverAddrs[i]))
+		n.replicas[i] = initReplica(n.serverAddrs, i, replicaR, &tt, n.createConnFunc(n.serverAddrs[i]))
 		synctest.Wait()
 	}
 	n.clients = make([]*client.Client, len(n.clientAddrs))
 	for i := range n.clients {
-		n.clients[i] = initClient(n.serverAddrs, uint64(i), n.createConnFunc(n.clientAddrs[i]))
+		n.clients[i] = initClient(n.serverAddrs, uint64(i), &tt, n.createConnFunc(n.clientAddrs[i]))
 		synctest.Wait()
 	}
 
 	// main loop
+	t.Logf("Start simulation at %v\n", tt.now)
 	for range numTicks {
 		// generate requests
 		for range requestPerTick {
@@ -288,15 +399,20 @@ func simulate(t *testing.T) {
 			}()
 			synctest.Wait()
 		}
-		//n.partition()                      // network partition
-		n.propagate()                      // propagate network messages
-		time.Sleep(100 * time.Millisecond) // move time
+		n.partition()                          // network partition
+		n.propagate()                          // propagate network messages
+		tt.advanceTime(100 * time.Millisecond) // advance time
 	}
+
+	for i, r := range n.replicas {
+		t.Logf("Replica %d, state: %s", i, r.GetState())
+	}
+	t.Logf("Cleanup loop at %v...", tt.now)
 
 	// extra loops to propagate background timers..
 	for range 1000 {
-		n.propagate()                      // propagate network
-		time.Sleep(300 * time.Millisecond) // move time
+		n.propagate()                          // propagate network
+		tt.advanceTime(300 * time.Millisecond) // advance time
 	}
 
 	for i, r := range n.replicas {
@@ -304,6 +420,7 @@ func simulate(t *testing.T) {
 	}
 
 	// close resources
+	tt.close()
 	for i, c := range n.clients {
 		assert.Assertf(c.Close() == nil, "Should successfully close client %d", i)
 		synctest.Wait()
@@ -313,5 +430,5 @@ func simulate(t *testing.T) {
 		synctest.Wait()
 	}
 
-	logging.Logf("Completed simulation at %v\n", time.Now())
+	t.Logf("Completed simulation at %v\n", tt.now)
 }
