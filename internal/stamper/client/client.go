@@ -116,11 +116,11 @@ func NewClient(
 }
 
 func (c *Client) Close() error {
-	// logging.Logf("[Client %d] closing...\n", c.config.ClientId)
+	logging.Logf("[Client %d] closing...\n", c.config.ClientId)
 	close(c.closing)
 	c.events <- event{etype: eventTypeClientClosing}
 	<-c.closed
-	// logging.Logf("[Client %d] closed...\n", c.config.ClientId)
+	logging.Logf("[Client %d] closed...\n", c.config.ClientId)
 	return nil
 }
 
@@ -148,7 +148,7 @@ func (c *Client) Request(body []byte) ([]byte, error) {
 				c.send(i, request)
 			}
 		case reply := <-c.replyCh:
-			if reply.RequestId != c.curRequestId { // ignore old replies
+			if reply.RequestId != c.curRequestId { // ignore replies for older requestId
 				continue
 			}
 			if reply.Error == stamper.ProtocolErrorExpiredRequestId {
@@ -178,7 +178,7 @@ func (c *Client) loop() {
 	logging.Logf("[Client %d] start loop...\n", c.config.ClientId)
 EventLoop:
 	for e := range c.events {
-		// fmt.Printf("Event %s\n", e.String())
+		// fmt.Printf("%v loop() Event %s\n", c.tt.Now(), e.String())
 		switch e.etype {
 		case eventTypeClientClosing:
 			for _, conn := range c.serverConns {
@@ -202,7 +202,7 @@ EventLoop:
 			conn, err := c.getConn(e.serverIdx)
 			if err != nil {
 				// TODO: log
-				return
+				continue
 			}
 
 			// send through the network
@@ -213,7 +213,7 @@ EventLoop:
 			})
 			if err != nil {
 				// TODO: log
-				return
+				continue
 			}
 		case eventTypeRecv:
 			assert.Assertf(e.recvEnvelope.Cmd == stamper.CmdTypeReply, "eventTypeRecv should receive CmdTypeReply, got: %s", e.recvEnvelope.Cmd.String())
@@ -273,6 +273,11 @@ func (c *Client) listen(serverIdx int, conn net.Conn) {
 }
 
 func (c *Client) getConn(serverIdx int) (net.Conn, error) {
+	select {
+	case <-c.closing:
+		return nil, ErrClientClosed
+	default:
+	}
 	if c.serverConns[serverIdx] == nil {
 		conn, err := c.createConn(c.config.ServerAddrs[serverIdx])
 		if err != nil {
