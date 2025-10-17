@@ -245,6 +245,7 @@ func (n *network) partition() {
 		dur := time.Duration(n.r.Int64N(int64(n.cutOffMax-n.cutOffMin))) + n.cutOffMin
 		n.serverCutOff[serverId] = n.now().Add(dur)
 		numPartitioned++
+		// fmt.Printf("%v partition node:%d until %v\n", n.now(), serverId, n.serverCutOff[serverId])
 	}
 
 	assert.Assertf(numPartitioned*2+1 <= len(n.serverAddrs), "Partition constrain breached, num:%d total:%d", numPartitioned, len(n.serverAddrs))
@@ -349,9 +350,9 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 
 func simulate(t *testing.T) {
 	const numServers = 3
-	const numClients = 1
-	const numTicks = 3000
-	const requestPerTick = 1
+	const numClients = 3
+	const numTicks = 30000
+	const requestPerTick = 3
 	r := rand.New(rand.NewPCG(123, 456))
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
 

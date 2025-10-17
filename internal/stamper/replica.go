@@ -428,6 +428,7 @@ func (r *Replica) handleViewChangeTimer() {
 }
 
 func (r *Replica) initViewChange(viewId uint64) {
+	// fmt.Printf("%v node:%d initViewChange fromViewId:%d toViewId:%d lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, r.viewId, viewId, r.lastLogId, r.commitId)
 	r.status = replicaStatusViewChange
 	r.viewId = viewId
 	r.broadcast(CmdTypeStartViewChange, &StartViewChange{
@@ -463,14 +464,17 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 	case CmdTypeStartViewChange:
 		startViewChange, ok := envelope.Payload.(*StartViewChange)
 		assert.Assert(ok, "should be able to cast envelope payload to *StartViewChange type")
+		// fmt.Printf("%v node:%d StartViewChange by_node:%d viewId:%d\n", r.tt.Now(), r.config.NodeId, startViewChange.NodeId, startViewChange.ViewId)
 		r.handleStartViewChange(startViewChange)
 	case CmdTypeDoViewChange:
 		doViewChange, ok := envelope.Payload.(*DoViewChange)
 		assert.Assert(ok, "should be able to cast envelope payload to *DoViewChange type")
+		// fmt.Printf("%v node:%d DoViewChange by_node:%d viewId:%d lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, doViewChange.NodeId, doViewChange.ViewId, doViewChange.LastLogId, doViewChange.CommitId)
 		r.handleDoViewChange(doViewChange)
 	case CmdTypeStartView:
 		startView, ok := envelope.Payload.(*StartView)
 		assert.Assert(ok, "should be able to cast envelope payload to *StartView type")
+		// fmt.Printf("%v node:%d StartView viewId:%d lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, startView.ViewId, startView.LastLogId, startView.CommitId)
 		r.handleStartView(startView)
 	case CmdTypeAck:
 		ack, ok := envelope.Payload.(*Ack)
@@ -708,12 +712,13 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 				best.LastNormalViewId == current.LastNormalViewId && best.LastLogId < current.LastLogId {
 				best = current
 			}
-			if bestCommitId > current.CommitId {
+			if bestCommitId < current.CommitId {
 				bestCommitId = current.CommitId
 			}
 		}
+		// fmt.Printf("%v node:%d quorum check on view:%d size:%d, lagLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, doViewChange.ViewId, len(set), best.LastLogId, bestCommitId)
 		// update state
-		r.replaceState(best.ViewId, best.LastLogId, best.CommitId, best.Logs, best.NodeId == r.config.NodeId)
+		r.replaceState(best.ViewId, best.LastLogId, bestCommitId, best.Logs, best.NodeId == r.config.NodeId)
 		if r.lastLogId > r.commitId {
 			r.quorumAddPrepareOk(r.lastLogId, r.config.NodeId)
 		}
@@ -729,10 +734,10 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 			}
 		}
 		r.broadcast(CmdTypeStartView, &StartView{
-			ViewId:    best.ViewId,
+			ViewId:    r.viewId,
 			Logs:      logs,
-			LastLogId: best.LastLogId,
-			CommitId:  best.CommitId,
+			LastLogId: r.lastLogId,
+			CommitId:  r.commitId,
 		})
 	}
 }
@@ -791,7 +796,7 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 	}
 
 	// update client table
-	for logId := r.commitId + 1; int(logId)-1 < len(r.logs) && logId <= r.lastLogId; logId++ {
+	for logId := r.commitId + 1; /*int(logId)-1 < len(r.logs) &&*/ logId <= r.lastLogId; logId++ {
 		index := int(logId) - 1
 		assert.Assertf(r.logs[index].LogId == logId, "Logs array should be ordered correctly, expected %d, found %d", logId, r.logs[index].LogId)
 		r.clients[r.logs[index].ClientId] = &clientTable{
@@ -845,7 +850,7 @@ func (r *Replica) quorumAddPrepareOk(logId uint64, nodeId int) uint64 {
 }
 
 func (r *Replica) doCommit(toCommitId uint64, sendReply bool) {
-	for logId := r.commitId + 1; int(logId)-1 < len(r.logs) && logId <= toCommitId; logId++ {
+	for logId := r.commitId + 1; /*int(logId)-1 < len(r.logs) &&*/ logId <= toCommitId; logId++ {
 		index := int(logId) - 1
 		// upcall & commit
 		assert.Assertf(r.logs[index].LogId == logId, "Logs array should be ordered correctly, expected %d, found %d", logId, r.logs[index].LogId)
