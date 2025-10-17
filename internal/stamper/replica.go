@@ -57,7 +57,7 @@ func (e eventType) String() string {
 	case eventTypeSend:
 		return "send"
 	case eventTypeHeartbeatCommit:
-		return "commit_delay"
+		return "heartbeat_commit"
 	case eventTypeViewChangeTimer:
 		return "view_change_timer"
 	case eventTypeMsgRecv:
@@ -440,26 +440,28 @@ func (r *Replica) initViewChange(viewId uint64) {
 func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 	assert.Assert(envelope != nil, "envelope should not be nil")
 
+	shouldAck := true
 	switch envelope.Cmd {
 	case CmdTypeRequest:
 		request, ok := envelope.Payload.(*Request)
 		assert.Assert(ok, "should be able to cast envelope payload to *Request type")
 		r.clientConns[request.ClientId] = conn // add clientId -> connection mapping
 		r.handleRequest(request)
-		return // continue to skip sending ack
+		shouldAck = false
 	case CmdTypePrepare:
 		prepare, ok := envelope.Payload.(*Prepare)
 		assert.Assert(ok, "should be able to cast envelope payload to *Prepare type")
-		r.handlePrepare(prepare)
+		shouldAck = r.handlePrepare(prepare)
 	case CmdTypePrepareOk:
 		prepareOk, ok := envelope.Payload.(*PrepareOk)
 		assert.Assert(ok, "should be able to cast envelope payload to *PrepareOk type")
-		r.handlePrepareOk(prepareOk)
+		shouldAck = r.handlePrepareOk(prepareOk)
 	case CmdTypeReply:
 		assert.Assert(false, "reply should not be sent to a server node")
 	case CmdTypeCommit:
 		commit, ok := envelope.Payload.(*Commit)
 		assert.Assert(ok, "should be able to cast envelope payload to *Commit type")
+		// fmt.Printf("%v node:%d Commit by_node:%d viewId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, envelope.FromNodeId, commit.ViewId, commit.CommitId)
 		r.handleCommit(commit)
 	case CmdTypeStartViewChange:
 		startViewChange, ok := envelope.Payload.(*StartViewChange)
@@ -487,9 +489,11 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 
 	// fire and forget the ack
 	// logging.Logf("Sending an Ack after msg %s, conn: %p\n", envelope.JsonStr(), conn)
-	err := r.encdec.Encode(conn, r.newEnvelope(CmdTypeAck, &Ack{envelope.EnvelopeId}))
-	if err != nil {
-		// TODO: log this error
+	if shouldAck {
+		err := r.encdec.Encode(conn, r.newEnvelope(CmdTypeAck, &Ack{envelope.EnvelopeId}))
+		if err != nil {
+			// TODO: log this error
+		}
 	}
 
 	// update view change timer
@@ -562,18 +566,18 @@ func (r *Replica) handleRequest(request *Request) {
 	r.lastCommitAt = r.tt.Now()
 }
 
-func (r *Replica) handlePrepare(prepare *Prepare) {
+func (r *Replica) handlePrepare(prepare *Prepare) (shouldAck bool) {
 	assert.Assert(prepare != nil, "prepare should not be nil")
 
 	if r.status != replicaStatusNormal {
-		return // replica in view change or recovery mode
+		return false // replica in view change or recovery mode
 	}
 	if !r.validateViewId(prepare.ViewId, false) {
-		return
+		return true
 	}
 	if r.lastLogId >= prepare.LogId {
 		// already existed
-		return
+		return true
 	}
 
 	// backup to apply commit from h.lastLogId + 1 until prepare.CommitId
@@ -581,7 +585,7 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 
 	if r.lastLogId+1 < prepare.LogId {
 		r.waitingPrepares[prepare.LogId] = prepare
-		return
+		return true
 	}
 
 	// advance log and add to client table
@@ -602,26 +606,25 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 		LogId:  r.lastLogId,
 		NodeId: r.config.NodeId,
 	})
+	return true
 }
 
-func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) {
+func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) (shouldAck bool) {
 	assert.Assert(prepareOk != nil, "prepareOk should not be nil")
 
 	if r.status != replicaStatusNormal {
-		return // replica in view change or recovery mode
+		return false // replica in view change or recovery mode
 	}
 	if !r.validateViewId(prepareOk.ViewId, true) {
-		return
+		return true
 	}
 	if r.commitId >= prepareOk.LogId {
-		return // committed, skip this log id
+		return true // committed, skip this log id
 	}
 
 	toCommitId := r.quorumAddPrepareOk(prepareOk.LogId, prepareOk.NodeId)
 	r.doCommit(toCommitId, true)
-	r.tt.AfterFunc(r.config.CommitDelayDuration, func() {
-		r.events <- event{etype: eventTypeHeartbeatCommit}
-	})
+	return true
 }
 
 func (r *Replica) handleCommit(commit *Commit) {
@@ -796,7 +799,7 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 	}
 
 	// update client table
-	for logId := r.commitId + 1; /*int(logId)-1 < len(r.logs) &&*/ logId <= r.lastLogId; logId++ {
+	for logId := r.commitId + 1; logId <= r.lastLogId; logId++ {
 		index := int(logId) - 1
 		assert.Assertf(r.logs[index].LogId == logId, "Logs array should be ordered correctly, expected %d, found %d", logId, r.logs[index].LogId)
 		r.clients[r.logs[index].ClientId] = &clientTable{
@@ -850,7 +853,10 @@ func (r *Replica) quorumAddPrepareOk(logId uint64, nodeId int) uint64 {
 }
 
 func (r *Replica) doCommit(toCommitId uint64, sendReply bool) {
-	for logId := r.commitId + 1; /*int(logId)-1 < len(r.logs) &&*/ logId <= toCommitId; logId++ {
+	if r.lastLogId < toCommitId {
+		toCommitId = r.lastLogId
+	}
+	for logId := r.commitId + 1; logId <= toCommitId; logId++ {
 		index := int(logId) - 1
 		// upcall & commit
 		assert.Assertf(r.logs[index].LogId == logId, "Logs array should be ordered correctly, expected %d, found %d", logId, r.logs[index].LogId)
