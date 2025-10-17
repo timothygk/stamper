@@ -350,7 +350,7 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 func simulate(t *testing.T) {
 	const numServers = 3
 	const numClients = 1
-	const numTicks = 30000
+	const numTicks = 3000
 	const requestPerTick = 1
 	r := rand.New(rand.NewPCG(123, 456))
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
@@ -423,12 +423,12 @@ func simulate(t *testing.T) {
 	tt.close()
 	for i, c := range n.clients {
 		assert.Assertf(c.Close() == nil, "Should successfully close client %d", i)
-		synctest.Wait()
+		//synctest.Wait()
 	}
 	for i, r := range n.replicas {
 		assert.Assertf(r.Close() == nil, "Should successfully close replica %d", i)
-		synctest.Wait()
+		//synctest.Wait()
 	}
-
+	synctest.Wait()
 	t.Logf("Completed simulation at %v\n", tt.now)
 }

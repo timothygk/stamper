@@ -167,9 +167,13 @@ func NewReplica(
 		lastPreparedLogId: make([]uint64, len(config.ServerAddrs)),
 		lastNormalViewId:  0,
 		lastChangedViewId: make([]uint64, len(config.ServerAddrs)),
+		doViewChangeSet:   make(map[uint64]map[int]*DoViewChange),
 	}
 	go replica.heartbeatLoop()
 	go replica.loop()
+	replica.viewChangeTimer = tt.AfterFunc(config.ViewChangeDelayDuration, func() {
+		replica.events <- event{etype: eventTypeViewChangeTimer}
+	})
 	return replica
 }
 
@@ -214,10 +218,7 @@ func (r *Replica) heartbeatLoop() {
 	for {
 		select {
 		case <-ticker:
-			r.events <- event{
-				etype:    eventTypeHeartbeatCommit,
-				commitId: 0,
-			}
+			r.events <- event{etype: eventTypeHeartbeatCommit}
 		case <-r.closing:
 			return
 		}
@@ -225,13 +226,10 @@ func (r *Replica) heartbeatLoop() {
 }
 
 func (r *Replica) loop() {
-	r.viewChangeTimer = r.tt.AfterFunc(r.config.ViewChangeDelayDuration, func() {
-		r.events <- event{etype: eventTypeViewChangeTimer}
-	})
 	logging.Logf("[Node %d] start loop...\n", r.config.NodeId)
 EventLoop:
 	for e := range r.events {
-		// logging.Logf("[Node %d] Event %s\n", r.config.NodeId, e.String())
+		// logging.Logf("%v [Node %d] Event %s\n", r.tt.Now(), r.config.NodeId, e.String())
 		switch e.etype {
 		case eventTypeReplicaClosing:
 			for _, conn := range r.serverConns {
@@ -720,9 +718,19 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 			r.quorumAddPrepareOk(r.lastLogId, r.config.NodeId)
 		}
 		// broadcast start view
+		logs := best.Logs
+		if best.NodeId == r.config.NodeId { // late copy of the logs
+			logs = make([]RequestLog, len(r.logs))
+			for i := range len(r.logs) {
+				logs[i].ClientId = r.logs[i].ClientId
+				logs[i].RequestId = r.logs[i].RequestId
+				logs[i].LogId = r.logs[i].LogId
+				logs[i].Body = r.logs[i].Body
+			}
+		}
 		r.broadcast(CmdTypeStartView, &StartView{
 			ViewId:    best.ViewId,
-			Logs:      best.Logs,
+			Logs:      logs,
 			LastLogId: best.LastLogId,
 			CommitId:  best.CommitId,
 		})
@@ -746,8 +754,7 @@ func (r *Replica) handleStartView(startView *StartView) {
 	r.replaceState(startView.ViewId, startView.LastLogId, startView.CommitId, startView.Logs, false)
 	// send prepareOk
 	if r.lastLogId > r.commitId {
-		primaryNodeId := r.primaryNode()
-		r.sendTo(primaryNodeId, CmdTypePrepareOk, &PrepareOk{
+		r.sendTo(r.primaryNode(), CmdTypePrepareOk, &PrepareOk{
 			ViewId: r.viewId,
 			LogId:  r.lastLogId,
 			NodeId: r.config.NodeId,
@@ -756,12 +763,14 @@ func (r *Replica) handleStartView(startView *StartView) {
 }
 
 func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []RequestLog, sameNode bool) {
+	assert.Assertf(viewId > r.lastNormalViewId, "Should not replaceState to lastNormalviewId, found viewId:%d lastNormalViewId:%d", viewId, r.lastNormalViewId)
 	r.viewId = viewId
 	r.lastNormalViewId = viewId
 	r.lastLogId = lastLogId
 
 	if !sameNode {
 		// copy logs
+		r.logs = make([]logEntry, len(logs))
 		for i := range logs {
 			r.logs[i].ClientId = logs[i].ClientId
 			r.logs[i].RequestId = logs[i].RequestId
@@ -782,14 +791,16 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 	}
 
 	// update client table
-	for logId := r.commitId + 1; logId <= r.lastLogId; logId++ {
-		index := logId - 1
+	for logId := r.commitId + 1; int(logId)-1 < len(r.logs) && logId <= r.lastLogId; logId++ {
+		index := int(logId) - 1
 		assert.Assertf(r.logs[index].LogId == logId, "Logs array should be ordered correctly, expected %d, found %d", logId, r.logs[index].LogId)
 		r.clients[r.logs[index].ClientId] = &clientTable{
 			requestId: r.logs[index].RequestId,
 			reply:     nil,
 		}
 	}
+
+	// update node status
 	r.status = replicaStatusNormal
 }
 
@@ -802,6 +813,12 @@ func (r *Replica) primaryNode() int {
 }
 
 func (r *Replica) appendLog(request *Request) {
+	assert.Assertf(
+		uint64(len(r.logs)) == r.lastLogId,
+		"Last log id should match len, found len:%d lastLogId:%d",
+		len(r.logs),
+		r.lastLogId,
+	)
 	r.lastLogId++
 	r.logs = append(r.logs, logEntry{
 		LogId:     r.lastLogId,
@@ -828,8 +845,8 @@ func (r *Replica) quorumAddPrepareOk(logId uint64, nodeId int) uint64 {
 }
 
 func (r *Replica) doCommit(toCommitId uint64, sendReply bool) {
-	for logId := r.commitId + 1; logId <= toCommitId; logId++ {
-		index := logId - 1
+	for logId := r.commitId + 1; int(logId)-1 < len(r.logs) && logId <= toCommitId; logId++ {
+		index := int(logId) - 1
 		// upcall & commit
 		assert.Assertf(r.logs[index].LogId == logId, "Logs array should be ordered correctly, expected %d, found %d", logId, r.logs[index].LogId)
 		responseBody := r.upcall(r.logs[index].Body)
