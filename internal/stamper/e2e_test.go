@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"reflect"
+	"runtime"
 	"sort"
 	"testing"
 	"testing/synctest"
@@ -88,11 +89,16 @@ func (t *mockedTimer) Reset(d time.Duration) bool {
 	return !isDone
 }
 
+type mockedTicker struct {
+	ch      chan time.Time
+	failCnt int
+}
+
 type mockedTime struct {
-	r      *rand.Rand
-	now    time.Time
-	timers []*mockedTimer
-	chans  []chan time.Time
+	r       *rand.Rand
+	now     time.Time
+	timers  []*mockedTimer
+	tickers []*mockedTicker
 }
 
 func (t *mockedTime) Now() time.Time {
@@ -104,16 +110,25 @@ func (t *mockedTime) AfterFunc(d time.Duration, f func()) timepkg.Timer {
 }
 
 func (t *mockedTime) Tick(d time.Duration) <-chan time.Time {
-	ch := make(chan time.Time)
+	ticker := &mockedTicker{
+		ch:      make(chan time.Time),
+		failCnt: 0,
+	}
 	var f func()
 	f = func() {
 		// ch <- t.now
-		reflect.ValueOf(ch).TrySend(reflect.ValueOf(t.now))
-		t.makeTimer(d, f)
+		if reflect.ValueOf(ticker.ch).TrySend(reflect.ValueOf(t.now)) {
+			ticker.failCnt = 0
+		} else {
+			ticker.failCnt++
+		}
+		if ticker.failCnt <= 10 {
+			t.makeTimer(d, f)
+		}
 	}
 	t.makeTimer(d, f)
-	t.chans = append(t.chans, ch)
-	return ch
+	t.tickers = append(t.tickers, ticker)
+	return ticker.ch
 }
 
 func (t *mockedTime) makeTimer(d time.Duration, fn func()) *mockedTimer {
@@ -146,23 +161,35 @@ func (t *mockedTime) advanceTime(d time.Duration) {
 		}
 	}
 
-	// clean up slice
+	// clean up timers
 	lastIndex := len(t.timers) - 1
 	for i := lastIndex; i >= 0; i-- {
 		if t.timers[i].invoked || t.timers[i].stopped {
 			// swap to the back
-			t.timers[i], t.timers[lastIndex] = t.timers[lastIndex], t.timers[i]
+			t.timers[i] = t.timers[lastIndex]
 			t.timers[lastIndex] = nil // remove reference
 			lastIndex--
 		}
 	}
 	t.timers = t.timers[:lastIndex+1]
+
+	// cleanup tickers
+	lastIndex = len(t.tickers) - 1
+	for i := lastIndex; i >= 0; i-- {
+		if t.tickers[i].failCnt > 10 {
+			// heuristic here
+			close(t.tickers[i].ch)
+			t.tickers[i] = t.tickers[lastIndex]
+			t.tickers[lastIndex] = nil // remove reference
+			lastIndex--
+		}
+	}
+	t.tickers = t.tickers[:lastIndex+1]
 }
 
 func (t *mockedTime) close() error {
-	for _, ch := range t.chans {
-		// reflect.ValueOf(ch).TryRecv()
-		close(ch)
+	for _, ticker := range t.tickers {
+		close(ticker.ch)
 	}
 	return nil
 }
@@ -258,8 +285,15 @@ func (n *network) propagate() {
 	}
 
 	tosend := []ToSend{}
-	for _, conn := range n.conns {
+	for i := 0; i < len(n.conns); i++ {
+		conn := n.conns[i]
 		if conn.closed {
+			lastIdx := len(n.conns) - 1
+			if i < lastIdx {
+				n.conns[i] = n.conns[lastIdx]
+				n.conns[lastIdx] = nil
+			}
+			n.conns = n.conns[:lastIdx]
 			continue
 		}
 		if len(conn.queue) == 0 {
@@ -350,9 +384,9 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 
 func simulate(t *testing.T) {
 	const numServers = 3
-	const numClients = 3
-	const numTicks = 30000
-	const requestPerTick = 3
+	const numClients = 1
+	const numTicks = 300000
+	const requestPerTick = 1
 	r := rand.New(rand.NewPCG(123, 456))
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
 
@@ -367,7 +401,7 @@ func simulate(t *testing.T) {
 		serverAddrs:  iotaWithPrefix("server", numServers, 0),
 		clientAddrs:  iotaWithPrefix("client", numClients, 0),
 		serverCutOff: make([]time.Time, numServers),
-		cutOffProb:   Fraction{35, 10000},
+		cutOffProb:   Fraction{35, 100},
 		cutOffMin:    time.Second,
 		cutOffMax:    15 * time.Second,
 	}
@@ -385,6 +419,7 @@ func simulate(t *testing.T) {
 
 	// main loop
 	t.Logf("Start simulation at %v\n", tt.now)
+	tickCnt := 0
 	for range numTicks {
 		// generate requests
 		for range requestPerTick {
@@ -403,6 +438,11 @@ func simulate(t *testing.T) {
 		n.partition()                          // network partition
 		n.propagate()                          // propagate network messages
 		tt.advanceTime(100 * time.Millisecond) // advance time
+
+		if tickCnt%10000 == 0 {
+			t.Logf("At tick %d, timers:%d timerchans:%d managedconn:%d numGoroutines=%d", tickCnt, len(tt.timers), len(tt.tickers), len(n.conns), runtime.NumGoroutine())
+		}
+		tickCnt++
 	}
 
 	for i, r := range n.replicas {
