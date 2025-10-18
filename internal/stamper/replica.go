@@ -419,9 +419,6 @@ func (r *Replica) handleViewChangeTimer() {
 	if r.config.NodeId == r.primaryNode() { // skip view change if it is the primary node
 		return
 	}
-	if r.status != replicaStatusNormal {
-		return
-	}
 	r.initViewChange(r.viewId + 1)
 	toViewId := r.quorumAddStartViewChange(r.viewId, r.config.NodeId)
 	assert.Assert(toViewId < r.viewId, "First view change timer should not have F replies from other replicas")
