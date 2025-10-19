@@ -640,7 +640,6 @@ func (r *Replica) handleCommit(commit *Commit) {
 func (r *Replica) handleStartViewChange(startViewChange *StartViewChange) {
 	assert.Assert(startViewChange != nil, "startViewChange should not be nil")
 
-	initialViewId := r.viewId
 	if startViewChange.ViewId > r.viewId {
 		// trigger view change
 		r.initViewChange(startViewChange.ViewId)
@@ -648,7 +647,7 @@ func (r *Replica) handleStartViewChange(startViewChange *StartViewChange) {
 	}
 
 	toViewId := r.quorumAddStartViewChange(startViewChange.ViewId, startViewChange.NodeId)
-	if toViewId > initialViewId {
+	if toViewId > r.lastNormalViewId {
 		nextPrimaryId := int(toViewId % uint64(len(r.config.ServerAddrs)))
 		doViewChange := &DoViewChange{
 			ViewId:           toViewId,
