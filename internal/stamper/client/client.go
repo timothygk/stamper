@@ -116,11 +116,11 @@ func NewClient(
 }
 
 func (c *Client) Close() error {
-	logging.Logf("[Client %d] closing...\n", c.config.ClientId)
+	// logging.Logf("[Client %d] closing...\n", c.config.ClientId)
 	close(c.closing)
 	c.events <- event{etype: eventTypeClientClosing}
 	<-c.closed
-	logging.Logf("[Client %d] closed...\n", c.config.ClientId)
+	// logging.Logf("[Client %d] closed...\n", c.config.ClientId)
 	return nil
 }
 
@@ -153,7 +153,9 @@ func (c *Client) Request(body []byte) ([]byte, error) {
 			}
 			if reply.Error == stamper.ProtocolErrorExpiredRequestId {
 				c.viewId = reply.ViewId
-				c.curRequestId += 1000 // TODO: just do a huge step?
+				if c.curRequestId == reply.RequestId {
+					c.curRequestId += 1000 // TODO: just do a huge step?
+				}
 				request = &stamper.Request{
 					ClientId:    c.config.ClientId,
 					RequestId:   c.curRequestId,
@@ -221,18 +223,18 @@ EventLoop:
 			assert.Assert(ok, "Should be able to upcast Payload to *Reply type")
 			assert.Assert(reply != nil, "Reply should not be nil")
 
+			if !c.isInflight.Load() {
+				continue
+			}
 			if reply.Error == stamper.ProtocolErrorReplicaNotReady ||
 				reply.Error == stamper.ProtocolErrorNotPrimaryNode {
 				continue // keep retrying
 			}
-			if reply.Error == stamper.ProtocolErrorExpiredRequestId {
-				c.replyCh <- reply // stop retrying, let the request thread handle it
-				continue
-			}
 
-			c.replyCh <- reply
+			c.replyCh <- reply // expired request id will be handled by caller
 		}
 	}
+
 
 	close(c.closed)
 }
