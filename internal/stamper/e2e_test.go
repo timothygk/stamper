@@ -233,10 +233,14 @@ func (c *conn) Close() error {
 	return c.Conn.Close()
 }
 
-func (c *conn) deliverOne() {
-	payload := c.queue[0]
-	c.queue = c.queue[1:]
-	// logging.Logf("deliverOne to conn %p c.Conn %p ch %p, %s\n", c, c.Conn, c.queue, string(payload))
+func (c *conn) deliver(index int) {
+	lastIndex := len(c.queue) - 1
+	if index != lastIndex {
+		c.queue[index], c.queue[lastIndex] = c.queue[lastIndex], c.queue[index]
+	}
+
+	var payload []byte
+	payload, c.queue = c.queue[lastIndex], c.queue[:lastIndex]
 	c.Conn.Write(payload)
 }
 
@@ -333,8 +337,12 @@ func (n *network) propagate() {
 	for len(tosend) > 0 {
 		// pick one to send the network request
 		i := n.r.IntN(len(tosend))
-		tosend[i].conn.deliverOne()
+
+		// pick one payload out of order & send
+		queueIdx := n.r.IntN(len(tosend[i].conn.queue))
+		tosend[i].conn.deliver(queueIdx)
 		synctest.Wait()
+
 		// decr counter & cleanup if needed
 		tosend[i].cnt--
 		if tosend[i].cnt == 0 {
@@ -403,10 +411,10 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 
 func simulate(t *testing.T) {
 	const numServers = 3
-	const numClients = 1
-	const numTicks = 90000
-	const requestPerTick = 1
-	r := rand.New(rand.NewPCG(123123, 45679445584))
+	const numClients = 3
+	const numTicks = 100000
+	const requestPerTick = 2
+	r := rand.New(rand.NewPCG(123123582, 45679445584))
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
 
 	// init
