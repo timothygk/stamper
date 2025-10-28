@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net"
 	"reflect"
@@ -31,6 +32,11 @@ type Fraction struct {
 
 func flipCoin(r *rand.Rand, prob Fraction) bool {
 	return r.Uint64N(prob.Denominator) < prob.Numerator
+}
+
+func logNormSeconds(r *rand.Rand, mean, stddev time.Duration) time.Duration {
+	value := (r.NormFloat64()*float64(stddev) + float64(mean)) / float64(time.Second)
+	return time.Duration(math.Floor(value)) * time.Second
 }
 
 func initReplica(addrs []string, nodeId int, r *rand.Rand, tt timepkg.Time, createConn func(string) (net.Conn, error), repair bool) *stamper.Replica {
@@ -254,13 +260,14 @@ type network struct {
 	clientAddrs []string
 	clients     []*client.Client
 	conns       []*conn
+	// TODO: better network latency distribution
 	// network loss
 	msgLossProb Fraction
 	// network partition
 	serverCutOff []time.Time
 	cutOffProb   Fraction
-	cutOffMin    time.Duration
-	cutOffMax    time.Duration
+	cutOffMean   time.Duration
+	cutOffStdDev time.Duration
 	// repair
 	tickStep      time.Duration
 	repairProb    Fraction
@@ -286,7 +293,7 @@ func (n *network) partition() {
 	}
 	if numPartitioned*2+1 < len(n.serverAddrs) && flipCoin(n.r, n.cutOffProb) {
 		serverId := n.r.IntN(len(n.serverAddrs))
-		dur := time.Duration(n.r.Int64N(int64(n.cutOffMax-n.cutOffMin))) + n.cutOffMin
+		dur := logNormSeconds(n.r, n.cutOffMean, n.cutOffStdDev)
 		n.serverCutOff[serverId] = n.now().Add(dur)
 		numPartitioned++
 		// fmt.Printf("%v partition node:%d until %v\n", n.now(), serverId, n.serverCutOff[serverId])
@@ -438,8 +445,8 @@ func simulate(t *testing.T) {
 		serverCutOff: make([]time.Time, numServers),
 		msgLossProb:  Fraction{1, 1000},
 		cutOffProb:   Fraction{35, 1000},
-		cutOffMin:    5 * time.Second,
-		cutOffMax:    30 * time.Second,
+		cutOffMean:   10 * time.Second,
+		cutOffStdDev: 5 * time.Second,
 		tickStep:     10 * time.Millisecond,
 		repairProb:   Fraction{3, 100},
 	}
