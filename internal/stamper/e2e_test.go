@@ -305,7 +305,7 @@ func (n *network) partition() {
 	}
 }
 
-func (n *network) propagate() {
+func (n *network) propagate(finishing bool) {
 	type ToSend struct {
 		conn *conn
 		cnt  int
@@ -344,7 +344,7 @@ func (n *network) propagate() {
 
 		// pick one payload out of order & send
 		queueIdx := n.r.IntN(len(tosend[i].conn.queue))
-		if flipCoin(n.r, n.msgLossProb) {
+		if !finishing && flipCoin(n.r, n.msgLossProb) {
 			tosend[i].conn.pop(queueIdx)
 		} else {
 			tosend[i].conn.deliver(queueIdx)
@@ -477,7 +477,7 @@ func simulate(t *testing.T) {
 			synctest.Wait()
 		}
 		n.partition()              // network partition
-		n.propagate()              // propagate network messages
+		n.propagate(false)         // propagate network messages
 		tt.advanceTime(n.tickStep) // advance time
 
 		if tickCnt%10000 == 0 {
@@ -492,13 +492,25 @@ func simulate(t *testing.T) {
 	t.Logf("Cleanup loop at %v...", tt.now)
 
 	// extra loops to propagate background timers..
-	for range 1000 {
-		n.propagate()                          // propagate network
-		tt.advanceTime(300 * time.Millisecond) // advance time
+	for d := 5 * time.Minute; d >= 0; d -= n.tickStep {
+		n.propagate(true)          // propagate network
+		tt.advanceTime(n.tickStep) // advance time
 	}
 
+	states := []string{}
 	for i, r := range n.replicas {
-		t.Logf("Replica %d, state: %s", i, r.GetState())
+		states = append(states, r.GetState())
+		t.Logf("Replica %d, state: %s", i, states[i])
+	}
+	for i := range len(states) - 1 {
+		assert.Assertf(
+			states[i] == states[i+1],
+			"State of replica %d and %d is not equal\n\t%s\n\t\tvs\n\t%s",
+			i,
+			i+1,
+			states[i],
+			states[i+1],
+		)
 	}
 
 	// close resources
