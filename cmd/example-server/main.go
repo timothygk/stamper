@@ -53,6 +53,7 @@ func main() {
 		SendRetryDuration:       3 * time.Second,
 		CommitDelayDuration:     5 * time.Second,
 		ViewChangeDelayDuration: 10 * time.Second,
+		RecoveryRetryDuration:   10 * time.Second,
 		NodeId:                  nodeId,
 		ServerAddrs:             addrs,
 	}
@@ -63,6 +64,7 @@ func main() {
 		CreateTcpConnection,
 		r,
 		func(body []byte) []byte { return append(body, []byte("_SUFFIXED")...) },
+		false,
 	)
 	defer func() {
 		fmt.Printf("Final state %s\n", replica.GetState())

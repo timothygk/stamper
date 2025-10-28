@@ -17,9 +17,9 @@ import (
 type replicaStatus int
 
 const (
-	replicaStatusNormal     replicaStatus = 1
-	replicaStatusViewChange replicaStatus = 2
-	replicaStatusRecovering replicaStatus = 3
+	ReplicaStatusNormal     replicaStatus = 1
+	ReplicaStatusViewChange replicaStatus = 2
+	ReplicaStatusRecovering replicaStatus = 3
 )
 
 type logEntry struct {
@@ -43,6 +43,7 @@ const (
 	eventTypeSend            eventType = 3
 	eventTypeHeartbeatCommit eventType = 4
 	eventTypeViewChangeTimer eventType = 5
+	eventTypeInitRecovery    eventType = 6
 	eventTypeMsgRecv         eventType = 100
 )
 
@@ -62,6 +63,8 @@ func (e eventType) String() string {
 		return "view_change_timer"
 	case eventTypeMsgRecv:
 		return "msg_recv"
+	case eventTypeInitRecovery:
+		return "init_recovery"
 	default:
 		return "UNKNOWN"
 	}
@@ -90,6 +93,7 @@ type ReplicaConfig struct {
 	SendRetryDuration       time.Duration
 	CommitDelayDuration     time.Duration
 	ViewChangeDelayDuration time.Duration
+	RecoveryRetryDuration   time.Duration
 	NodeId                  int
 	ServerAddrs             []string // configurations, currently it is static
 }
@@ -127,10 +131,14 @@ type Replica struct {
 	waitingPrepares   map[uint64]*Prepare // logId -> prepare request
 	lastPreparedLogId []uint64            // node -> last prepared log id
 	lastCommitAt      time.Time           // last commit time
+	// view-change related
 	lastNormalViewId  uint64
 	lastChangedViewId []uint64 // last view change id
 	viewChangeTimer   timepkg.Timer
 	doViewChangeSet   map[uint64]map[int]*DoViewChange // viewId -> {nodeId -> doViewChange}
+	// recovery related
+	recoveryNonce     uint64
+	recoveryResponses []*RecoveryResponse
 }
 
 // NewReplica create a new replica
@@ -141,6 +149,7 @@ func NewReplica(
 	createConn func(string) (net.Conn, error),
 	r *rand.Rand,
 	upcall func([]byte) []byte,
+	recovery bool,
 ) *Replica {
 	replica := &Replica{
 		config:     config,
@@ -154,7 +163,7 @@ func NewReplica(
 		envelopeIdR:       r,
 		events:            make(chan event, 1000),
 		viewId:            0,
-		status:            replicaStatusNormal, // TODO: should start with recovering??
+		status:            ReplicaStatusNormal,
 		lastLogId:         0,
 		logs:              make([]logEntry, 0, 1000),
 		commitId:          0,
@@ -168,6 +177,12 @@ func NewReplica(
 		lastNormalViewId:  0,
 		lastChangedViewId: make([]uint64, len(config.ServerAddrs)),
 		doViewChangeSet:   make(map[uint64]map[int]*DoViewChange),
+	}
+	if recovery {
+		replica.status = ReplicaStatusRecovering
+		replica.recoveryNonce = r.Uint64()
+		replica.recoveryResponses = make([]*RecoveryResponse, len(config.ServerAddrs))
+		replica.events <- event{etype: eventTypeInitRecovery}
 	}
 	go replica.heartbeatLoop()
 	go replica.loop()
@@ -190,6 +205,10 @@ func (r *Replica) GetState() string {
 		r.lastLogId,
 		h.Sum(nil),
 	)
+}
+
+func (r *Replica) Status() replicaStatus {
+	return r.status
 }
 
 // Accept accept a network connection
@@ -274,6 +293,8 @@ EventLoop:
 			r.handleHeartbeatCommit()
 		case eventTypeViewChangeTimer:
 			r.handleViewChangeTimer()
+		case eventTypeInitRecovery:
+			r.handleInitRecovery()
 		case eventTypeMsgRecv:
 			r.handleMsgRecv(e.conn, e.envelope)
 		default:
@@ -341,7 +362,9 @@ func (r *Replica) sendTo(targetNodeId int, cmd CmdType, payload any) {
 
 	// create envlope & wait for ack
 	envelope := r.newEnvelope(cmd, payload)
-	r.waitAck[envelope.EnvelopeId] = struct{}{}
+	if cmd != CmdTypeCommit {
+		r.waitAck[envelope.EnvelopeId] = struct{}{}
+	}
 	r.events <- event{
 		etype:        eventTypeSend,
 		envelope:     envelope,
@@ -363,18 +386,20 @@ func (r *Replica) handleSend(targetNodeId int, envelope *Envelope) {
 	assert.Assert(envelope != nil, "Should not send with nil envelope")
 
 	// check if it is ack-ed
-	if _, ok := r.waitAck[envelope.EnvelopeId]; !ok {
+	if _, ok := r.waitAck[envelope.EnvelopeId]; !ok && envelope.Cmd != CmdTypeCommit {
 		return
 	}
 
 	// defer to retry
-	defer r.tt.AfterFunc(r.config.SendRetryDuration, func() {
-		r.events <- event{
-			etype:        eventTypeSend,
-			envelope:     envelope,
-			targetNodeId: targetNodeId,
-		}
-	})
+	if envelope.Cmd != CmdTypeCommit {
+		defer r.tt.AfterFunc(r.config.SendRetryDuration, func() {
+			r.events <- event{
+				etype:        eventTypeSend,
+				envelope:     envelope,
+				targetNodeId: targetNodeId,
+			}
+		})
+	}
 
 	if r.serverConns[targetNodeId] == nil {
 		conn, err := r.createConn(r.config.ServerAddrs[targetNodeId])
@@ -397,6 +422,9 @@ func (r *Replica) handleSend(targetNodeId int, envelope *Envelope) {
 }
 
 func (r *Replica) handleHeartbeatCommit() {
+	if r.status != ReplicaStatusNormal {
+		return
+	}
 	if r.primaryNode() != r.config.NodeId {
 		return // skip if this is not the primary node
 	}
@@ -416,6 +444,9 @@ func (r *Replica) handleViewChangeTimer() {
 	// always reset timer
 	defer r.viewChangeTimer.Reset(r.config.ViewChangeDelayDuration)
 
+	if r.status == ReplicaStatusRecovering {
+		return
+	}
 	if r.config.NodeId == r.primaryNode() { // skip view change if it is the primary node
 		return
 	}
@@ -424,9 +455,24 @@ func (r *Replica) handleViewChangeTimer() {
 	assert.Assert(toViewId < r.viewId, "First view change timer should not have F replies from other replicas")
 }
 
+func (r *Replica) handleInitRecovery() {
+	if r.status != ReplicaStatusRecovering {
+		return
+	}
+
+	r.broadcast(CmdTypeRecovery, &Recovery{
+		NodeId: r.config.NodeId,
+		Nonce:  r.recoveryNonce,
+	})
+
+	r.tt.AfterFunc(r.config.RecoveryRetryDuration, func() {
+		r.events <- event{etype: eventTypeInitRecovery}
+	})
+}
+
 func (r *Replica) initViewChange(viewId uint64) {
 	// fmt.Printf("%v node:%d initViewChange fromViewId:%d toViewId:%d lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, r.viewId, viewId, r.lastLogId, r.commitId)
-	r.status = replicaStatusViewChange
+	r.status = ReplicaStatusViewChange
 	r.viewId = viewId
 	r.broadcast(CmdTypeStartViewChange, &StartViewChange{
 		ViewId: r.viewId,
@@ -460,6 +506,7 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 		assert.Assert(ok, "should be able to cast envelope payload to *Commit type")
 		// fmt.Printf("%v node:%d Commit by_node:%d viewId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, envelope.FromNodeId, commit.ViewId, commit.CommitId)
 		r.handleCommit(commit)
+		shouldAck = false
 	case CmdTypeStartViewChange:
 		startViewChange, ok := envelope.Payload.(*StartViewChange)
 		assert.Assert(ok, "should be able to cast envelope payload to *StartViewChange type")
@@ -475,6 +522,14 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 		assert.Assert(ok, "should be able to cast envelope payload to *StartView type")
 		// fmt.Printf("%v node:%d StartView viewId:%d lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, startView.ViewId, startView.LastLogId, startView.CommitId)
 		r.handleStartView(startView)
+	case CmdTypeRecovery:
+		recovery, ok := envelope.Payload.(*Recovery)
+		assert.Assert(ok, "should be able to cast envelope payload to *Recovery type")
+		r.handleRecovery(recovery)
+	case CmdTypeRecoveryResponse:
+		recoveryResponse, ok := envelope.Payload.(*RecoveryResponse)
+		assert.Assert(ok, "should be able to cast envelope payload to *RecoveryResponse type")
+		r.handleRecoveryResponse(recoveryResponse)
 	case CmdTypeAck:
 		ack, ok := envelope.Payload.(*Ack)
 		assert.Assert(ok, "should be able to cast envelope payload to *Ack type")
@@ -503,7 +558,7 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 func (r *Replica) handleRequest(request *Request) {
 	assert.Assert(request != nil, "request should not be nil")
 
-	if r.status != replicaStatusNormal {
+	if r.status != ReplicaStatusNormal {
 		// replica is not ready to accept request
 		r.sendReply(request.ClientId, &Reply{
 			ViewId:    r.viewId,
@@ -566,7 +621,7 @@ func (r *Replica) handleRequest(request *Request) {
 func (r *Replica) handlePrepare(prepare *Prepare) (shouldAck bool) {
 	assert.Assert(prepare != nil, "prepare should not be nil")
 
-	if r.status != replicaStatusNormal {
+	if r.status != ReplicaStatusNormal {
 		return false // replica in view change or recovery mode
 	}
 	if !r.validateViewId(prepare.ViewId, false) {
@@ -609,7 +664,7 @@ func (r *Replica) handlePrepare(prepare *Prepare) (shouldAck bool) {
 func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) (shouldAck bool) {
 	assert.Assert(prepareOk != nil, "prepareOk should not be nil")
 
-	if r.status != replicaStatusNormal {
+	if r.status != ReplicaStatusNormal {
 		return false // replica in view change or recovery mode
 	}
 	if !r.validateViewId(prepareOk.ViewId, true) {
@@ -627,7 +682,7 @@ func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) (shouldAck bool) {
 func (r *Replica) handleCommit(commit *Commit) {
 	assert.Assert(commit != nil, "commit should not be nil")
 
-	if r.status != replicaStatusNormal {
+	if r.status != ReplicaStatusNormal {
 		return // replica in view change or recovery mode
 	}
 	if !r.validateViewId(commit.ViewId, false) {
@@ -639,6 +694,10 @@ func (r *Replica) handleCommit(commit *Commit) {
 
 func (r *Replica) handleStartViewChange(startViewChange *StartViewChange) {
 	assert.Assert(startViewChange != nil, "startViewChange should not be nil")
+
+	if r.status == ReplicaStatusRecovering {
+		return
+	}
 
 	if startViewChange.ViewId > r.viewId {
 		// trigger view change
@@ -681,10 +740,13 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 		r.config.NodeId,
 	)
 
+	if r.status == ReplicaStatusRecovering {
+		return
+	}
 	if doViewChange.ViewId < r.viewId {
 		return // skip if incoming view id is outdated
 	}
-	if doViewChange.ViewId == r.viewId && r.status == replicaStatusNormal {
+	if doViewChange.ViewId == r.viewId && r.status == ReplicaStatusNormal {
 		return // skip if view id matched
 	}
 	if doViewChange.ViewId > r.viewId {
@@ -724,13 +786,7 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 		// broadcast start view
 		logs := best.Logs
 		if best.NodeId == r.config.NodeId { // late copy of the logs
-			logs = make([]RequestLog, len(r.logs))
-			for i := range len(r.logs) {
-				logs[i].ClientId = r.logs[i].ClientId
-				logs[i].RequestId = r.logs[i].RequestId
-				logs[i].LogId = r.logs[i].LogId
-				logs[i].Body = r.logs[i].Body
-			}
+			logs = r.copyLogs()
 		}
 		r.broadcast(CmdTypeStartView, &StartView{
 			ViewId:    r.viewId,
@@ -750,7 +806,10 @@ func (r *Replica) handleStartView(startView *StartView) {
 		r.config.NodeId,
 	)
 
-	if startView.ViewId < r.viewId || startView.ViewId == r.viewId && r.status == replicaStatusNormal {
+	if r.status == ReplicaStatusRecovering {
+		return
+	}
+	if startView.ViewId < r.viewId || startView.ViewId == r.viewId && r.status == ReplicaStatusNormal {
 		return
 	}
 
@@ -763,6 +822,78 @@ func (r *Replica) handleStartView(startView *StartView) {
 			LogId:  r.lastLogId,
 			NodeId: r.config.NodeId,
 		})
+	}
+}
+
+func (r *Replica) handleRecovery(recovery *Recovery) {
+	assert.Assert(recovery != nil, "recovery should not be nil")
+	assert.Assertf(
+		recovery.NodeId != r.config.NodeId,
+		"Recovery sent to the same node id, recovery.NodeId=%d, nodeId=%d",
+		recovery.NodeId,
+		r.config.NodeId,
+	)
+
+	if r.status != ReplicaStatusNormal {
+		return
+	}
+
+	response := &RecoveryResponse{
+		ViewId:     r.viewId,
+		Nonce:      recovery.Nonce,
+		FromNodeId: r.config.NodeId,
+	}
+	if r.primaryNode() == r.config.NodeId {
+		response.Logs = r.copyLogs()
+		response.LastLogId = r.lastLogId
+		response.CommitId = r.commitId
+	}
+	r.sendTo(recovery.NodeId, CmdTypeRecoveryResponse, response)
+}
+
+func (r *Replica) handleRecoveryResponse(recoveryResponse *RecoveryResponse) {
+	assert.Assert(recoveryResponse != nil, "recoveryResponse should not be nil")
+	assert.Assertf(
+		recoveryResponse.FromNodeId != r.config.NodeId,
+		"RecoveryResponse sent to the same node id, recoveryResponse.FromNodeId=%d, nodeId=%d",
+		recoveryResponse.FromNodeId,
+		r.config.NodeId,
+	)
+
+	if r.status != ReplicaStatusRecovering {
+		return
+	}
+	if recoveryResponse.Nonce != r.recoveryNonce {
+		return
+	}
+
+	r.recoveryResponses[recoveryResponse.FromNodeId] = recoveryResponse
+	maxViewId := uint64(0)
+	count := 0
+	for _, response := range r.recoveryResponses {
+		if response != nil {
+			count++
+			if response.ViewId > maxViewId {
+				maxViewId = response.ViewId
+			}
+		}
+	}
+	threshold := (len(r.config.ServerAddrs))/2 + 1
+	primaryNodeId := int(maxViewId % uint64(len(r.config.ServerAddrs)))
+	primaryNodeResponse := r.recoveryResponses[primaryNodeId]
+	if count >= threshold && primaryNodeResponse != nil && primaryNodeResponse.ViewId == maxViewId {
+		// update state
+		r.replaceState(
+			primaryNodeResponse.ViewId,
+			primaryNodeResponse.LastLogId,
+			primaryNodeResponse.CommitId,
+			primaryNodeResponse.Logs,
+			false,
+		)
+		// cleanup
+		for i := range r.recoveryResponses {
+			r.recoveryResponses[i] = nil // unset
+		}
 	}
 }
 
@@ -805,7 +936,7 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 	}
 
 	// update node status
-	r.status = replicaStatusNormal
+	r.status = ReplicaStatusNormal
 }
 
 func (r *Replica) validateViewId(viewId uint64, shouldBePrimary bool) bool {
@@ -834,6 +965,17 @@ func (r *Replica) appendLog(request *Request) {
 		requestId: request.RequestId,
 		reply:     nil,
 	}
+}
+
+func (r *Replica) copyLogs() []RequestLog {
+	logs := make([]RequestLog, len(r.logs))
+	for i := range len(r.logs) {
+		logs[i].ClientId = r.logs[i].ClientId
+		logs[i].RequestId = r.logs[i].RequestId
+		logs[i].LogId = r.logs[i].LogId
+		logs[i].Body = r.logs[i].Body
+	}
+	return logs
 }
 
 func (r *Replica) quorumAddPrepareOk(logId uint64, nodeId int) uint64 {

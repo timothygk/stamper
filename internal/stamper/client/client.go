@@ -154,7 +154,7 @@ func (c *Client) Request(body []byte) ([]byte, error) {
 			if reply.Error == stamper.ProtocolErrorExpiredRequestId {
 				c.viewId = reply.ViewId
 				if c.curRequestId == reply.RequestId {
-					c.curRequestId += 1000 // TODO: just do a huge step?
+					c.curRequestId += 1000 // TODO: implement client recovery
 				}
 				request = &stamper.Request{
 					ClientId:    c.config.ClientId,

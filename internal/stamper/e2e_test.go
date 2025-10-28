@@ -33,11 +33,12 @@ func flipCoin(r *rand.Rand, prob Fraction) bool {
 	return r.Uint64N(prob.Denominator) < prob.Numerator
 }
 
-func initReplica(addrs []string, nodeId int, r *rand.Rand, tt timepkg.Time, createConn func(string) (net.Conn, error)) *stamper.Replica {
+func initReplica(addrs []string, nodeId int, r *rand.Rand, tt timepkg.Time, createConn func(string) (net.Conn, error), repair bool) *stamper.Replica {
 	config := stamper.ReplicaConfig{
 		SendRetryDuration:       3 * time.Second,
 		CommitDelayDuration:     5 * time.Second,
 		ViewChangeDelayDuration: 10 * time.Second,
+		RecoveryRetryDuration:   10 * time.Second,
 		NodeId:                  nodeId,
 		ServerAddrs:             addrs,
 	}
@@ -48,6 +49,7 @@ func initReplica(addrs []string, nodeId int, r *rand.Rand, tt timepkg.Time, crea
 		createConn,
 		r,
 		func(body []byte) []byte { return append(body, []byte("_SUFFIXED")...) },
+		repair,
 	)
 	return replica
 }
@@ -251,6 +253,10 @@ type network struct {
 	cutOffProb   Fraction
 	cutOffMin    time.Duration
 	cutOffMax    time.Duration
+	// repair
+	tickStep      time.Duration
+	repairProb    Fraction
+	createReplica func(int, *rand.Rand, bool) *stamper.Replica
 }
 
 func (n *network) isPartitioned(idx int) bool {
@@ -266,6 +272,9 @@ func (n *network) partition() {
 		if n.isPartitioned(i) {
 			numPartitioned++
 		}
+		if n.replicas[i].Status() == stamper.ReplicaStatusRecovering {
+			numPartitioned++
+		}
 	}
 	if numPartitioned*2+1 < len(n.serverAddrs) && flipCoin(n.r, n.cutOffProb) {
 		serverId := n.r.IntN(len(n.serverAddrs))
@@ -276,6 +285,16 @@ func (n *network) partition() {
 	}
 
 	assert.Assertf(numPartitioned*2+1 <= len(n.serverAddrs), "Partition constrain breached, num:%d total:%d", numPartitioned, len(n.serverAddrs))
+
+	// trigger repair
+	for i := range n.replicas {
+		if !n.isPartitioned(i) && n.serverCutOff[i].After(n.now().Add(-n.tickStep)) && flipCoin(n.r, n.repairProb) {
+			// trigger repair
+			assert.Assertf(n.replicas[i].Close() == nil, "Should be able to close replica %d", i)
+			n.replicas[i] = n.createReplica(i, rand.New(rand.NewPCG(n.r.Uint64(), n.r.Uint64())), true)
+			synctest.Wait()
+		}
+	}
 }
 
 func (n *network) propagate() {
@@ -385,9 +404,9 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 func simulate(t *testing.T) {
 	const numServers = 3
 	const numClients = 1
-	const numTicks = 300000
+	const numTicks = 90000
 	const requestPerTick = 1
-	r := rand.New(rand.NewPCG(123, 456))
+	r := rand.New(rand.NewPCG(123123, 45679445584))
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
 
 	// init
@@ -401,14 +420,19 @@ func simulate(t *testing.T) {
 		serverAddrs:  iotaWithPrefix("server", numServers, 0),
 		clientAddrs:  iotaWithPrefix("client", numClients, 0),
 		serverCutOff: make([]time.Time, numServers),
-		cutOffProb:   Fraction{35, 100},
-		cutOffMin:    time.Second,
-		cutOffMax:    15 * time.Second,
+		cutOffProb:   Fraction{35, 1000},
+		cutOffMin:    5 * time.Second,
+		cutOffMax:    30 * time.Second,
+		tickStep:     10 * time.Millisecond,
+		repairProb:   Fraction{1, 100},
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
+	n.createReplica = func(i int, r *rand.Rand, repair bool) *stamper.Replica {
+		return initReplica(n.serverAddrs, i, r, &tt, n.createConnFunc(n.serverAddrs[i]), repair)
+	}
 	for i := range n.replicas {
 		replicaR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
-		n.replicas[i] = initReplica(n.serverAddrs, i, replicaR, &tt, n.createConnFunc(n.serverAddrs[i]))
+		n.replicas[i] = n.createReplica(i, replicaR, false)
 		synctest.Wait()
 	}
 	n.clients = make([]*client.Client, len(n.clientAddrs))
@@ -435,9 +459,9 @@ func simulate(t *testing.T) {
 			}()
 			synctest.Wait()
 		}
-		n.partition()                          // network partition
-		n.propagate()                          // propagate network messages
-		tt.advanceTime(100 * time.Millisecond) // advance time
+		n.partition()                         // network partition
+		n.propagate()                         // propagate network messages
+		tt.advanceTime(n.tickStep) // advance time
 
 		if tickCnt%10000 == 0 {
 			t.Logf("At tick %d, timers:%d timerchans:%d managedconn:%d numGoroutines=%d", tickCnt, len(tt.timers), len(tt.tickers), len(n.conns), runtime.NumGoroutine())
