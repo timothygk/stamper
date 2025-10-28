@@ -233,15 +233,17 @@ func (c *conn) Close() error {
 	return c.Conn.Close()
 }
 
-func (c *conn) deliver(index int) {
+func (c *conn) pop(index int) (payload []byte) {
 	lastIndex := len(c.queue) - 1
 	if index != lastIndex {
 		c.queue[index], c.queue[lastIndex] = c.queue[lastIndex], c.queue[index]
 	}
-
-	var payload []byte
 	payload, c.queue = c.queue[lastIndex], c.queue[:lastIndex]
-	c.Conn.Write(payload)
+	return payload
+}
+
+func (c *conn) deliver(index int) {
+	c.Conn.Write(c.pop(index))
 }
 
 type network struct {
@@ -252,6 +254,8 @@ type network struct {
 	clientAddrs []string
 	clients     []*client.Client
 	conns       []*conn
+	// network loss
+	msgLossProb Fraction
 	// network partition
 	serverCutOff []time.Time
 	cutOffProb   Fraction
@@ -340,7 +344,11 @@ func (n *network) propagate() {
 
 		// pick one payload out of order & send
 		queueIdx := n.r.IntN(len(tosend[i].conn.queue))
-		tosend[i].conn.deliver(queueIdx)
+		if flipCoin(n.r, n.msgLossProb) {
+			tosend[i].conn.pop(queueIdx)
+		} else {
+			tosend[i].conn.deliver(queueIdx)
+		}
 		synctest.Wait()
 
 		// decr counter & cleanup if needed
@@ -428,11 +436,12 @@ func simulate(t *testing.T) {
 		serverAddrs:  iotaWithPrefix("server", numServers, 0),
 		clientAddrs:  iotaWithPrefix("client", numClients, 0),
 		serverCutOff: make([]time.Time, numServers),
+		msgLossProb:  Fraction{1, 1000},
 		cutOffProb:   Fraction{35, 1000},
 		cutOffMin:    5 * time.Second,
 		cutOffMax:    30 * time.Second,
 		tickStep:     10 * time.Millisecond,
-		repairProb:   Fraction{1, 100},
+		repairProb:   Fraction{3, 100},
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	n.createReplica = func(i int, r *rand.Rand, repair bool) *stamper.Replica {
@@ -467,8 +476,8 @@ func simulate(t *testing.T) {
 			}()
 			synctest.Wait()
 		}
-		n.partition()                         // network partition
-		n.propagate()                         // propagate network messages
+		n.partition()              // network partition
+		n.propagate()              // propagate network messages
 		tt.advanceTime(n.tickStep) // advance time
 
 		if tickCnt%10000 == 0 {
