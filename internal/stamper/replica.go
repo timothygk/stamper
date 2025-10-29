@@ -187,7 +187,11 @@ func NewReplica(
 	go replica.heartbeatLoop()
 	go replica.loop()
 	replica.viewChangeTimer = tt.AfterFunc(config.ViewChangeDelayDuration, func() {
-		replica.events <- event{etype: eventTypeViewChangeTimer}
+		select {
+		case <-replica.closing:
+		default:
+			replica.events <- event{etype: eventTypeViewChangeTimer}
+		}
 	})
 	return replica
 }
@@ -393,10 +397,14 @@ func (r *Replica) handleSend(targetNodeId int, envelope *Envelope) {
 	// defer to retry
 	if envelope.Cmd != CmdTypeCommit {
 		defer r.tt.AfterFunc(r.config.SendRetryDuration, func() {
-			r.events <- event{
-				etype:        eventTypeSend,
-				envelope:     envelope,
-				targetNodeId: targetNodeId,
+			select {
+			case <-r.closing:
+			default:
+				r.events <- event{
+					etype:        eventTypeSend,
+					envelope:     envelope,
+					targetNodeId: targetNodeId,
+				}
 			}
 		})
 	}
@@ -466,7 +474,11 @@ func (r *Replica) handleInitRecovery() {
 	})
 
 	r.tt.AfterFunc(r.config.RecoveryRetryDuration, func() {
-		r.events <- event{etype: eventTypeInitRecovery}
+		select {
+		case <-r.closing:
+		default:
+			r.events <- event{etype: eventTypeInitRecovery}
+		}
 	})
 }
 

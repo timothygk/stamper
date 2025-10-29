@@ -34,9 +34,9 @@ func flipCoin(r *rand.Rand, prob Fraction) bool {
 	return r.Uint64N(prob.Denominator) < prob.Numerator
 }
 
-func logNormSeconds(r *rand.Rand, mean, stddev time.Duration) time.Duration {
-	value := (r.NormFloat64()*float64(stddev) + float64(mean)) / float64(time.Second)
-	return time.Duration(math.Floor(value)) * time.Second
+func logNormDuration(r *rand.Rand, mean, stddev, norm time.Duration) time.Duration {
+	value := (r.NormFloat64()*float64(stddev) + float64(mean)) / float64(norm)
+	return time.Duration(math.Floor(value)) * norm
 }
 
 func initReplica(addrs []string, nodeId int, r *rand.Rand, tt timepkg.Time, createConn func(string) (net.Conn, error), repair bool) *stamper.Replica {
@@ -202,12 +202,19 @@ func (t *mockedTime) close() error {
 	return nil
 }
 
+type payload struct {
+	data      []byte
+	deliverAt time.Time
+}
+
 type conn struct {
 	net.Conn
-	srcIdx int
-	dstIdx int
-	queue  [][]byte
-	closed bool
+	n          *network
+	srcIdx     int
+	dstIdx     int
+	toSchedule [][]byte
+	toSend     []payload
+	closed     bool
 }
 
 func newConn(pipeConn net.Conn, srcIdx, dstIdx int) *conn {
@@ -224,7 +231,7 @@ func (c *conn) Write(b []byte) (int, error) {
 		return 0, io.EOF
 	}
 	// logging.Logf("Write to conn %p c.Conn %p ch %p, %s\n", c, c.Conn, c.queue, string(b))
-	c.queue = append(c.queue, bytes.Clone(b))
+	c.toSchedule = append(c.toSchedule, bytes.Clone(b))
 	return len(b), nil
 }
 
@@ -239,19 +246,6 @@ func (c *conn) Close() error {
 	return c.Conn.Close()
 }
 
-func (c *conn) pop(index int) (payload []byte) {
-	lastIndex := len(c.queue) - 1
-	if index != lastIndex {
-		c.queue[index], c.queue[lastIndex] = c.queue[lastIndex], c.queue[index]
-	}
-	payload, c.queue = c.queue[lastIndex], c.queue[:lastIndex]
-	return payload
-}
-
-func (c *conn) deliver(index int) {
-	c.Conn.Write(c.pop(index))
-}
-
 type network struct {
 	r           *rand.Rand
 	now         func() time.Time
@@ -260,7 +254,9 @@ type network struct {
 	clientAddrs []string
 	clients     []*client.Client
 	conns       []*conn
-	// TODO: better network latency distribution
+	// transport
+	transportDelayMean   time.Duration
+	transportDelayStdDev time.Duration
 	// network loss
 	msgLossProb Fraction
 	// network partition
@@ -293,7 +289,7 @@ func (n *network) partition() {
 	}
 	if numPartitioned*2+1 < len(n.serverAddrs) && flipCoin(n.r, n.cutOffProb) {
 		serverId := n.r.IntN(len(n.serverAddrs))
-		dur := logNormSeconds(n.r, n.cutOffMean, n.cutOffStdDev)
+		dur := logNormDuration(n.r, n.cutOffMean, n.cutOffStdDev, time.Second)
 		n.serverCutOff[serverId] = n.now().Add(dur)
 		numPartitioned++
 		// fmt.Printf("%v partition node:%d until %v\n", n.now(), serverId, n.serverCutOff[serverId])
@@ -313,14 +309,35 @@ func (n *network) partition() {
 }
 
 func (n *network) propagate(finishing bool) {
-	type ToSend struct {
-		conn *conn
-		cnt  int
+	// schedule queued payloads with random delay & out-of-order delivery
+	for _, conn := range n.conns {
+		for _, data := range conn.toSchedule {
+			deliverAt := n.now().Add(n.transportDelayMean)
+			if !finishing {
+				dur := logNormDuration(n.r, n.transportDelayMean, n.transportDelayStdDev, time.Microsecond)
+				deliverAt = n.now().Add(dur)
+			}
+			conn.toSend = append(conn.toSend, payload{
+				data:      data,
+				deliverAt: deliverAt,
+			})
+		}
+		conn.toSchedule = nil
 	}
 
+	// get msgs to send
+	type ToSend struct {
+		conn      *conn
+		data      []byte
+		deliverAt time.Time
+	}
 	tosend := []ToSend{}
 	for i := 0; i < len(n.conns); i++ {
 		conn := n.conns[i]
+		if n.isPartitioned(conn.dstIdx) {
+			conn.Close()
+			synctest.Wait()
+		}
 		if conn.closed {
 			lastIdx := len(n.conns) - 1
 			if i < lastIdx {
@@ -330,43 +347,40 @@ func (n *network) propagate(finishing bool) {
 			n.conns = n.conns[:lastIdx]
 			continue
 		}
-		if len(conn.queue) == 0 {
-			continue
-		}
-		if n.isPartitioned(conn.dstIdx) {
-			conn.Close()
-			synctest.Wait()
-			continue
-		}
-		numToSend := n.r.IntN(len(conn.queue) + 1)
-		if numToSend > 0 {
-			tosend = append(tosend, ToSend{conn, numToSend})
+
+		for i := len(conn.toSend) - 1; i >= 0; i-- {
+			p := conn.toSend[i]
+			if !p.deliverAt.After(n.now()) {
+				// deliverAt <= now
+				tosend = append(tosend, ToSend{
+					conn:      conn,
+					data:      p.data,
+					deliverAt: p.deliverAt,
+				})
+
+				// pop
+				lastIdx := len(conn.toSend) - 1
+				if lastIdx != i {
+					conn.toSend[i] = conn.toSend[lastIdx]
+				}
+				conn.toSend = conn.toSend[:lastIdx]
+			}
 		}
 	}
 
-	// shuffled delivery
-	for len(tosend) > 0 {
-		// pick one to send the network request
-		i := n.r.IntN(len(tosend))
+	// sort by delivery time, unlikely to have collision i.e. exactly the same delivery time
+	sort.Slice(tosend, func(i, j int) bool {
+		return tosend[i].deliverAt.Before(tosend[j].deliverAt)
+	})
 
-		// pick one payload out of order & send
-		queueIdx := n.r.IntN(len(tosend[i].conn.queue))
+	// send msgs
+	for _, ts := range tosend {
 		if !finishing && flipCoin(n.r, n.msgLossProb) {
-			tosend[i].conn.pop(queueIdx)
-		} else {
-			tosend[i].conn.deliver(queueIdx)
+			continue // msg loss
 		}
+		// deliver
+		ts.conn.Conn.Write(ts.data)
 		synctest.Wait()
-
-		// decr counter & cleanup if needed
-		tosend[i].cnt--
-		if tosend[i].cnt == 0 {
-			lastIdx := len(tosend) - 1
-			if i != lastIdx {
-				tosend[i], tosend[lastIdx] = tosend[lastIdx], tosend[i]
-			}
-			tosend = tosend[:lastIdx]
-		}
 	}
 }
 
@@ -426,8 +440,8 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 
 func simulate(t *testing.T) {
 	const numServers = 3
-	const numClients = 3
-	const numTicks = 100000
+	const numClients = 10
+	const numTicks = 1000000
 	const requestPerTick = 2
 	r := rand.New(rand.NewPCG(123123582, 45679445584))
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
@@ -438,17 +452,19 @@ func simulate(t *testing.T) {
 		now: time.Now(), // deterministic
 	}
 	n := network{
-		r:            rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
-		now:          tt.Now,
-		serverAddrs:  iotaWithPrefix("server", numServers, 0),
-		clientAddrs:  iotaWithPrefix("client", numClients, 0),
-		serverCutOff: make([]time.Time, numServers),
-		msgLossProb:  Fraction{1, 1000},
-		cutOffProb:   Fraction{35, 1000},
-		cutOffMean:   10 * time.Second,
-		cutOffStdDev: 5 * time.Second,
-		tickStep:     10 * time.Millisecond,
-		repairProb:   Fraction{3, 100},
+		r:                    rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
+		now:                  tt.Now,
+		serverAddrs:          iotaWithPrefix("server", numServers, 0),
+		clientAddrs:          iotaWithPrefix("client", numClients, 0),
+		serverCutOff:         make([]time.Time, numServers),
+		transportDelayMean:   500 * time.Microsecond,
+		transportDelayStdDev: 500 * time.Microsecond,
+		msgLossProb:          Fraction{1, 1000},
+		cutOffProb:           Fraction{1, 1000},
+		cutOffMean:           10 * time.Second,
+		cutOffStdDev:         5 * time.Second,
+		tickStep:             500 * time.Microsecond,
+		repairProb:           Fraction{3, 100},
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	n.createReplica = func(i int, r *rand.Rand, repair bool) *stamper.Replica {
@@ -487,8 +503,15 @@ func simulate(t *testing.T) {
 		n.propagate(false)         // propagate network messages
 		tt.advanceTime(n.tickStep) // advance time
 
-		if tickCnt%10000 == 0 {
-			t.Logf("At tick %d, timers:%d timerchans:%d managedconn:%d numGoroutines=%d", tickCnt, len(tt.timers), len(tt.tickers), len(n.conns), runtime.NumGoroutine())
+		if tickCnt%100000 == 0 {
+			t.Logf(
+				"At tick %d, timers:%d timerchans:%d managedconn:%d numGoroutines=%d",
+				tickCnt,
+				len(tt.timers),
+				len(tt.tickers),
+				len(n.conns),
+				runtime.NumGoroutine(),
+			)
 		}
 		tickCnt++
 	}
