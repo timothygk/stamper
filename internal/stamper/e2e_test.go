@@ -215,7 +215,6 @@ type conn struct {
 	srcIdx     int
 	dstIdx     int
 	toSchedule [][]byte
-	toSend     []payload
 	closed     bool
 }
 
@@ -250,7 +249,7 @@ func (c *conn) Close() error {
 
 type network struct {
 	r           *rand.Rand
-	now         func() time.Time
+	tt          *mockedTime
 	serverAddrs []string
 	replicas    []*stamper.Replica
 	clientAddrs []string
@@ -276,7 +275,7 @@ func (n *network) isPartitioned(idx int) bool {
 	if idx >= len(n.serverAddrs) {
 		return false
 	}
-	return n.serverCutOff[idx].After(n.now())
+	return n.serverCutOff[idx].After(n.tt.now)
 }
 
 func (n *network) partition() {
@@ -292,16 +291,16 @@ func (n *network) partition() {
 	if numPartitioned*2+1 < len(n.serverAddrs) && flipCoin(n.r, n.cutOffProb) {
 		serverId := n.r.IntN(len(n.serverAddrs))
 		dur := logNormDuration(n.r, n.cutOffMean, n.cutOffStdDev, time.Second)
-		n.serverCutOff[serverId] = n.now().Add(dur)
+		n.serverCutOff[serverId] = n.tt.now.Add(dur)
 		numPartitioned++
-		// fmt.Printf("%v partition node:%d until %v\n", n.now(), serverId, n.serverCutOff[serverId])
+		// fmt.Printf("%v partition node:%d until %v\n", n.t.now, serverId, n.serverCutOff[serverId])
 	}
 
 	assert.Assertf(numPartitioned*2+1 <= len(n.serverAddrs), "Partition constrain breached, num:%d total:%d", numPartitioned, len(n.serverAddrs))
 
 	// trigger repair
 	for i := range n.replicas {
-		if !n.isPartitioned(i) && n.serverCutOff[i].After(n.now().Add(-n.tickStep)) && flipCoin(n.r, n.repairProb) {
+		if !n.isPartitioned(i) && n.serverCutOff[i].After(n.tt.now.Add(-n.tickStep)) && flipCoin(n.r, n.repairProb) {
 			// trigger repair
 			assert.Assertf(n.replicas[i].Close() == nil, "Should be able to close replica %d", i)
 			n.replicas[i] = n.createReplica(i, rand.New(rand.NewPCG(n.r.Uint64(), n.r.Uint64())), true)
@@ -314,32 +313,30 @@ func (n *network) propagate(finishing bool) {
 	// schedule queued payloads with random delay & out-of-order delivery
 	for _, conn := range n.conns {
 		for _, data := range conn.toSchedule {
-			deliverAt := n.now().Add(n.transportDelayMean)
+			dur := n.transportDelayMean
 			if !finishing {
-				dur := logNormDuration(n.r, n.transportDelayMean, n.transportDelayStdDev, time.Microsecond)
-				deliverAt = n.now().Add(dur)
+				dur = logNormDuration(n.r, n.transportDelayMean, n.transportDelayStdDev, time.Microsecond)
 			}
-			conn.toSend = append(conn.toSend, payload{
-				data:      data,
-				deliverAt: deliverAt,
+
+			n.tt.makeTimer(dur, func() {
+				if n.isPartitioned(conn.dstIdx) {
+					conn.Close()
+					synctest.Wait()
+				}
+				if !finishing && flipCoin(n.r, n.msgLossProb) {
+					return // msg loss
+				}
+				// deliver
+				conn.Conn.Write(data)
+				synctest.Wait()
 			})
 		}
 		conn.toSchedule = nil
 	}
 
-	// get msgs to send
-	type ToSend struct {
-		conn      *conn
-		data      []byte
-		deliverAt time.Time
-	}
-	tosend := []ToSend{}
+	// cleanup
 	for i := 0; i < len(n.conns); i++ {
 		conn := n.conns[i]
-		if n.isPartitioned(conn.dstIdx) {
-			conn.Close()
-			synctest.Wait()
-		}
 		if conn.closed {
 			lastIdx := len(n.conns) - 1
 			if i < lastIdx {
@@ -349,40 +346,6 @@ func (n *network) propagate(finishing bool) {
 			n.conns = n.conns[:lastIdx]
 			continue
 		}
-
-		for i := len(conn.toSend) - 1; i >= 0; i-- {
-			p := conn.toSend[i]
-			if !p.deliverAt.After(n.now()) {
-				// deliverAt <= now
-				tosend = append(tosend, ToSend{
-					conn:      conn,
-					data:      p.data,
-					deliverAt: p.deliverAt,
-				})
-
-				// pop
-				lastIdx := len(conn.toSend) - 1
-				if lastIdx != i {
-					conn.toSend[i] = conn.toSend[lastIdx]
-				}
-				conn.toSend = conn.toSend[:lastIdx]
-			}
-		}
-	}
-
-	// sort by delivery time, unlikely to have collision i.e. exactly the same delivery time
-	sort.Slice(tosend, func(i, j int) bool {
-		return tosend[i].deliverAt.Before(tosend[j].deliverAt)
-	})
-
-	// send msgs
-	for _, ts := range tosend {
-		if !finishing && flipCoin(n.r, n.msgLossProb) {
-			continue // msg loss
-		}
-		// deliver
-		ts.conn.Conn.Write(ts.data)
-		synctest.Wait()
 	}
 }
 
@@ -450,7 +413,7 @@ func simulate(t *testing.T, numServers, numClients, numTicks, requestPerTick int
 	}
 	n := network{
 		r:                    rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
-		now:                  tt.Now,
+		tt:                   &tt,
 		serverAddrs:          iotaWithPrefix("server", numServers, 0),
 		clientAddrs:          iotaWithPrefix("client", numClients, 0),
 		serverCutOff:         make([]time.Time, numServers),
@@ -492,6 +455,7 @@ func simulate(t *testing.T, numServers, numClients, numTicks, requestPerTick int
 				assert.Assertf(err == nil || err == client.ErrAnotherRequestInflight || err == client.ErrClientClosed, "Unknown error: %v", err)
 				if err == nil {
 					assert.Assertf(bytes.HasPrefix(result, payload), "Expected prefix: %x, actual: %x", payload, result)
+					assert.Assertf(bytes.Equal(result, append(payload, []byte("_SUFFIXED")...)), "Expected prefix: %x, actual: %x", payload, result)
 				}
 			}()
 			synctest.Wait()
