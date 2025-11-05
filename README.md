@@ -16,7 +16,7 @@ VSR
 - [x] view change protocol
 - [x] recovery protocol
 - [ ] client recovery
-- [ ] spill to disk
+- [ ] checkpointing
 - [ ] state transfer
 - [ ] batching
 - [ ] reconfiguration

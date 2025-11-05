@@ -22,7 +22,9 @@ import (
 )
 
 func TestSimulation(t *testing.T) {
-	synctest.Test(t, simulate)
+	synctest.Test(t, func(t *testing.T) {
+		simulate(t, 3, 10, 1000000, 2, rand.New(rand.NewPCG(123123582, 45679445584)))
+	})
 }
 
 type Fraction struct {
@@ -438,12 +440,7 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 	return result
 }
 
-func simulate(t *testing.T) {
-	const numServers = 3
-	const numClients = 10
-	const numTicks = 1000000
-	const requestPerTick = 2
-	r := rand.New(rand.NewPCG(123123582, 45679445584))
+func simulate(t *testing.T, numServers, numClients, numTicks, requestPerTick int, r *rand.Rand) {
 	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
 
 	// init
