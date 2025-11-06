@@ -30,6 +30,7 @@ Simulation testing
   - [x] simple network partition
   - [ ] more complex network partition
 - [ ] CI to run simulation with random configurations
-- [x] end in same state check
+- [x] reply correctness check
+- [x] eventually ended in the same state check
 - [ ] message loss check
 - [ ] split brain check

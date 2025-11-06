@@ -23,7 +23,28 @@ import (
 
 func TestSimulation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		simulate(t, 3, 10, 1000000, 2, rand.New(rand.NewPCG(123123582, 45679445584)))
+		simulate(t, &SimulatorConfig{
+			NumServers: 3,
+			NumClients: 10,
+			ReplicaConfig: stamper.ReplicaConfig{
+				SendRetryDuration:       3 * time.Second,
+				CommitDelayDuration:     5 * time.Second,
+				ViewChangeDelayDuration: 10 * time.Second,
+				RecoveryRetryDuration:   10 * time.Second,
+			},
+			Seed1:                123123582,
+			Seed2:                45679445584,
+			RequestPerTick:       2,
+			NumTicks:             1000000,
+			TickStep:             500 * time.Microsecond,
+			TransportDelayMean:   500 * time.Microsecond,
+			TransportDelayStdDev: 500 * time.Microsecond,
+			MsgLossProb:          Fraction{1, 1000},
+			CutOffProb:           Fraction{1, 1000},
+			CutOffMean:           10 * time.Second,
+			CutOffStdDev:         5 * time.Second,
+			RepairProb:           Fraction{5, 100},
+		})
 	})
 }
 
@@ -39,27 +60,6 @@ func flipCoin(r *rand.Rand, prob Fraction) bool {
 func logNormDuration(r *rand.Rand, mean, stddev, norm time.Duration) time.Duration {
 	value := (r.NormFloat64()*float64(stddev) + float64(mean)) / float64(norm)
 	return time.Duration(math.Floor(value)) * norm
-}
-
-func initReplica(addrs []string, nodeId int, r *rand.Rand, tt timepkg.Time, createConn func(string) (net.Conn, error), repair bool) *stamper.Replica {
-	config := stamper.ReplicaConfig{
-		SendRetryDuration:       3 * time.Second,
-		CommitDelayDuration:     5 * time.Second,
-		ViewChangeDelayDuration: 10 * time.Second,
-		RecoveryRetryDuration:   10 * time.Second,
-		NodeId:                  nodeId,
-		ServerAddrs:             addrs,
-	}
-	replica := stamper.NewReplica(
-		config,
-		tt,
-		stamper.JsonEncoderDecoder{},
-		createConn,
-		r,
-		func(body []byte) []byte { return append(body, []byte("_SUFFIXED")...) },
-		repair,
-	)
-	return replica
 }
 
 func initClient(serverAddrs []string, clientId uint64, tt timepkg.Time, createConn func(string) (net.Conn, error)) *client.Client {
@@ -231,14 +231,12 @@ func (c *conn) Write(b []byte) (int, error) {
 	if c.closed {
 		return 0, io.EOF
 	}
-	// logging.Logf("Write to conn %p c.Conn %p ch %p, %s\n", c, c.Conn, c.queue, string(b))
 	c.toSchedule = append(c.toSchedule, bytes.Clone(b))
 	return len(b), nil
 }
 
 func (c *conn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	// logging.Logf("Read recv conn %p c.Conn %p %s\n", c, c.Conn, string(b[:n]))
 	return n, err
 }
 
@@ -247,28 +245,62 @@ func (c *conn) Close() error {
 	return c.Conn.Close()
 }
 
-type network struct {
-	r           *rand.Rand
-	tt          *mockedTime
-	serverAddrs []string
-	replicas    []*stamper.Replica
-	clientAddrs []string
-	clients     []*client.Client
-	conns       []*conn
+type SimulatorConfig struct {
+	NumServers    int
+	NumClients    int
+	ReplicaConfig stamper.ReplicaConfig
+	// rng
+	Seed1 uint64
+	Seed2 uint64
+	// simulation
+	RequestPerTick int
+	NumTicks       int
+	TickStep       time.Duration
 	// transport
-	transportDelayMean   time.Duration
-	transportDelayStdDev time.Duration
+	TransportDelayMean   time.Duration
+	TransportDelayStdDev time.Duration
 	// network loss
-	msgLossProb Fraction
+	MsgLossProb Fraction
 	// network partition
-	serverCutOff []time.Time
-	cutOffProb   Fraction
-	cutOffMean   time.Duration
-	cutOffStdDev time.Duration
+	CutOffProb   Fraction
+	CutOffMean   time.Duration
+	CutOffStdDev time.Duration
 	// repair
-	tickStep      time.Duration
-	repairProb    Fraction
-	createReplica func(int, *rand.Rand, bool) *stamper.Replica
+	RepairProb Fraction
+}
+
+type network struct {
+	config       *SimulatorConfig
+	r            *rand.Rand
+	tt           *mockedTime
+	serverAddrs  []string
+	replicas     []*stamper.Replica
+	clientAddrs  []string
+	clients      []*client.Client
+	conns        []*conn
+	serverCutOff []time.Time
+}
+
+func newNetwork(config *SimulatorConfig, r *rand.Rand, tt *mockedTime) *network {
+	n := network{
+		config:       config,
+		r:            rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
+		tt:           tt,
+		serverAddrs:  iotaWithPrefix("server", config.NumServers, 0),
+		clientAddrs:  iotaWithPrefix("client", config.NumClients, 0),
+		serverCutOff: make([]time.Time, config.NumServers),
+	}
+	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
+	for i := range n.replicas {
+		n.replicas[i] = n.createReplica(i, false)
+		synctest.Wait()
+	}
+	n.clients = make([]*client.Client, len(n.clientAddrs))
+	for i := range n.clients {
+		n.clients[i] = initClient(n.serverAddrs, uint64(i), tt, n.createConnFunc(n.clientAddrs[i]))
+		synctest.Wait()
+	}
+	return &n
 }
 
 func (n *network) isPartitioned(idx int) bool {
@@ -288,22 +320,21 @@ func (n *network) partition() {
 			numPartitioned++
 		}
 	}
-	if numPartitioned*2+1 < len(n.serverAddrs) && flipCoin(n.r, n.cutOffProb) {
+	if numPartitioned*2+1 < len(n.serverAddrs) && flipCoin(n.r, n.config.CutOffProb) {
 		serverId := n.r.IntN(len(n.serverAddrs))
-		dur := logNormDuration(n.r, n.cutOffMean, n.cutOffStdDev, time.Second)
+		dur := logNormDuration(n.r, n.config.CutOffMean, n.config.CutOffStdDev, time.Second)
 		n.serverCutOff[serverId] = n.tt.now.Add(dur)
 		numPartitioned++
-		// fmt.Printf("%v partition node:%d until %v\n", n.t.now, serverId, n.serverCutOff[serverId])
 	}
 
 	assert.Assertf(numPartitioned*2+1 <= len(n.serverAddrs), "Partition constrain breached, num:%d total:%d", numPartitioned, len(n.serverAddrs))
 
 	// trigger repair
 	for i := range n.replicas {
-		if !n.isPartitioned(i) && n.serverCutOff[i].After(n.tt.now.Add(-n.tickStep)) && flipCoin(n.r, n.repairProb) {
+		if !n.isPartitioned(i) && n.serverCutOff[i].After(n.tt.now.Add(-n.config.TickStep)) && flipCoin(n.r, n.config.RepairProb) {
 			// trigger repair
 			assert.Assertf(n.replicas[i].Close() == nil, "Should be able to close replica %d", i)
-			n.replicas[i] = n.createReplica(i, rand.New(rand.NewPCG(n.r.Uint64(), n.r.Uint64())), true)
+			n.replicas[i] = n.createReplica(i, true)
 			synctest.Wait()
 		}
 	}
@@ -313,9 +344,9 @@ func (n *network) propagate(finishing bool) {
 	// schedule queued payloads with random delay & out-of-order delivery
 	for _, conn := range n.conns {
 		for _, data := range conn.toSchedule {
-			dur := n.transportDelayMean
+			dur := n.config.TransportDelayMean
 			if !finishing {
-				dur = logNormDuration(n.r, n.transportDelayMean, n.transportDelayStdDev, time.Microsecond)
+				dur = logNormDuration(n.r, n.config.TransportDelayMean, n.config.TransportDelayStdDev, time.Microsecond)
 			}
 
 			n.tt.makeTimer(dur, func() {
@@ -323,7 +354,7 @@ func (n *network) propagate(finishing bool) {
 					conn.Close()
 					synctest.Wait()
 				}
-				if !finishing && flipCoin(n.r, n.msgLossProb) {
+				if !finishing && flipCoin(n.r, n.config.MsgLossProb) {
 					return // msg loss
 				}
 				// deliver
@@ -335,7 +366,7 @@ func (n *network) propagate(finishing bool) {
 	}
 
 	// cleanup
-	for i := 0; i < len(n.conns); i++ {
+	for i := len(n.conns) - 1; i >= 0; i-- {
 		conn := n.conns[i]
 		if conn.closed {
 			lastIdx := len(n.conns) - 1
@@ -387,12 +418,23 @@ func (n *network) createConnFunc(srcAddr string) func(string) (net.Conn, error) 
 		n.replicas[dstIdx].Accept(sconn)
 		n.conns = append(n.conns, cconn)
 		n.conns = append(n.conns, sconn)
-		// logging.Logf("Create conn src: (%s, %p, %p, %p) dst: (%s, %p, %p, %p)\n",
-		// 	srcAddr, cconn, cconn.Conn, cconn.queue,
-		// 	dstAddr, sconn, sconn.Conn, sconn.queue,
-		// )
 		return cconn, nil
 	}
+}
+
+func (n *network) createReplica(i int, repair bool) *stamper.Replica {
+	replicaConfig := n.config.ReplicaConfig // copy
+	replicaConfig.NodeId = i
+	replicaConfig.ServerAddrs = n.serverAddrs
+	return stamper.NewReplica(
+		replicaConfig,
+		n.tt,
+		stamper.JsonEncoderDecoder{},
+		n.createConnFunc(n.serverAddrs[i]),
+		rand.New(rand.NewPCG(n.r.Uint64(), n.r.Uint64())),
+		func(body []byte) []byte { return append(body, []byte("_SUFFIXED")...) },
+		repair,
+	)
 }
 
 func iotaWithPrefix(prefix string, num int, start int) []string {
@@ -403,66 +445,41 @@ func iotaWithPrefix(prefix string, num int, start int) []string {
 	return result
 }
 
-func simulate(t *testing.T, numServers, numClients, numTicks, requestPerTick int, r *rand.Rand) {
-	clientR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
-
+func simulate(t *testing.T, config *SimulatorConfig) {
 	// init
+	r := rand.New(rand.NewPCG(config.Seed1, config.Seed2))
 	tt := mockedTime{
-		r:   rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
+		r:   r,
 		now: time.Now(), // deterministic
 	}
-	n := network{
-		r:                    rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
-		tt:                   &tt,
-		serverAddrs:          iotaWithPrefix("server", numServers, 0),
-		clientAddrs:          iotaWithPrefix("client", numClients, 0),
-		serverCutOff:         make([]time.Time, numServers),
-		transportDelayMean:   500 * time.Microsecond,
-		transportDelayStdDev: 500 * time.Microsecond,
-		msgLossProb:          Fraction{1, 1000},
-		cutOffProb:           Fraction{1, 1000},
-		cutOffMean:           10 * time.Second,
-		cutOffStdDev:         5 * time.Second,
-		tickStep:             500 * time.Microsecond,
-		repairProb:           Fraction{3, 100},
-	}
-	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
-	n.createReplica = func(i int, r *rand.Rand, repair bool) *stamper.Replica {
-		return initReplica(n.serverAddrs, i, r, &tt, n.createConnFunc(n.serverAddrs[i]), repair)
-	}
-	for i := range n.replicas {
-		replicaR := rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))
-		n.replicas[i] = n.createReplica(i, replicaR, false)
-		synctest.Wait()
-	}
-	n.clients = make([]*client.Client, len(n.clientAddrs))
-	for i := range n.clients {
-		n.clients[i] = initClient(n.serverAddrs, uint64(i), &tt, n.createConnFunc(n.clientAddrs[i]))
-		synctest.Wait()
-	}
+	n := newNetwork(config, r, &tt)
 
 	// main loop
 	t.Logf("Start simulation at %v\n", tt.now)
 	tickCnt := 0
-	for range numTicks {
+	for range config.NumTicks {
 		// generate requests
-		for range requestPerTick {
-			index := clientR.IntN(len(n.clients))
+		for range config.RequestPerTick {
+			index := r.IntN(len(n.clients))
 			payload := make([]byte, 8)
-			binary.LittleEndian.PutUint64(payload, clientR.Uint64())
+			binary.LittleEndian.PutUint64(payload, r.Uint64())
 			go func() {
 				result, err := n.clients[index].Request(payload)
 				assert.Assertf(err == nil || err == client.ErrAnotherRequestInflight || err == client.ErrClientClosed, "Unknown error: %v", err)
 				if err == nil {
-					assert.Assertf(bytes.HasPrefix(result, payload), "Expected prefix: %x, actual: %x", payload, result)
-					assert.Assertf(bytes.Equal(result, append(payload, []byte("_SUFFIXED")...)), "Expected prefix: %x, actual: %x", payload, result)
+					assert.Assertf(
+						bytes.Equal(result, append(payload, []byte("_SUFFIXED")...)),
+						"Expected prefix: %x, actual: %x",
+						payload,
+						result,
+					)
 				}
 			}()
 			synctest.Wait()
 		}
-		n.partition()              // network partition
-		n.propagate(false)         // propagate network messages
-		tt.advanceTime(n.tickStep) // advance time
+		n.partition()                   // network partition
+		n.propagate(false)              // propagate network messages
+		tt.advanceTime(config.TickStep) // advance time
 
 		if tickCnt%100000 == 0 {
 			t.Logf(
@@ -483,9 +500,9 @@ func simulate(t *testing.T, numServers, numClients, numTicks, requestPerTick int
 	t.Logf("Cleanup loop at %v...", tt.now)
 
 	// extra loops to propagate background timers..
-	for d := 5 * time.Minute; d >= 0; d -= n.tickStep {
-		n.propagate(true)          // propagate network
-		tt.advanceTime(n.tickStep) // advance time
+	for d := 5 * time.Minute; d >= 0; d -= config.TickStep {
+		n.propagate(true)               // propagate network
+		tt.advanceTime(config.TickStep) // advance time
 	}
 
 	states := []string{}
