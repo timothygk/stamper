@@ -34,8 +34,9 @@ const (
 	eventTypeConnClosed      eventType = 2
 	eventTypeSend            eventType = 3
 	eventTypeHeartbeatCommit eventType = 4
-	eventTypeViewChangeTimer eventType = 5
-	eventTypeInitRecovery    eventType = 6
+	eventTypeResendPrepares  eventType = 5
+	eventTypeViewChangeTimer eventType = 6
+	eventTypeInitRecovery    eventType = 7
 	eventTypeMsgRecv         eventType = 100
 )
 
@@ -51,6 +52,8 @@ func (e eventType) String() string {
 		return "send"
 	case eventTypeHeartbeatCommit:
 		return "heartbeat_commit"
+	case eventTypeResendPrepares:
+		return "resend_prepares"
 	case eventTypeViewChangeTimer:
 		return "view_change_timer"
 	case eventTypeMsgRecv:
@@ -178,6 +181,7 @@ func NewReplica(
 		replica.events <- event{etype: eventTypeInitRecovery}
 	}
 	go replica.heartbeatLoop()
+	go replica.resendPreparesLoop()
 	go replica.loop()
 	replica.viewChangeTimer = tt.AfterFunc(config.ViewChangeDelayDuration, func() {
 		select {
@@ -239,6 +243,19 @@ func (r *Replica) heartbeatLoop() {
 	}
 }
 
+func (r *Replica) resendPreparesLoop() {
+	ticker := r.tt.Tick(r.config.SendRetryDuration)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.Chan():
+			r.events <- event{etype: eventTypeResendPrepares}
+		case <-r.closing:
+			return
+		}
+	}
+}
+
 func (r *Replica) loop() {
 	logging.Logf("[Node %d] start loop...\n", r.config.NodeId)
 EventLoop:
@@ -286,6 +303,8 @@ EventLoop:
 			r.handleSend(e.targetNodeId, e.envelope)
 		case eventTypeHeartbeatCommit:
 			r.handleHeartbeatCommit()
+		case eventTypeResendPrepares:
+			r.handleResendPrepares()
 		case eventTypeViewChangeTimer:
 			r.handleViewChangeTimer()
 		case eventTypeInitRecovery:
@@ -380,6 +399,8 @@ func (r *Replica) handleSend(targetNodeId int, envelope *Envelope) {
 	assert.Assertf(targetNodeId != r.config.NodeId, "Should not send payload to the same node, node_id:%d\n", targetNodeId)
 	assert.Assert(envelope != nil, "Should not send with nil envelope")
 
+	// TODO: remove ack check, enforce retry on prepare msg instead
+
 	// check if it is ack-ed
 	if _, ok := r.waitAck[envelope.EnvelopeId]; !ok && envelope.Cmd != CmdTypeCommit {
 		return
@@ -387,17 +408,17 @@ func (r *Replica) handleSend(targetNodeId int, envelope *Envelope) {
 
 	// defer to retry
 	if envelope.Cmd != CmdTypeCommit {
-		defer r.tt.AfterFunc(r.config.SendRetryDuration, func() {
-			select {
-			case <-r.closing:
-			default:
-				r.events <- event{
-					etype:        eventTypeSend,
-					envelope:     envelope,
-					targetNodeId: targetNodeId,
-				}
-			}
-		})
+		//defer r.tt.AfterFunc(r.config.SendRetryDuration, func() {
+		//	select {
+		//	case <-r.closing:
+		//	default:
+		//		r.events <- event{
+		//			etype:        eventTypeSend,
+		//			envelope:     envelope,
+		//			targetNodeId: targetNodeId,
+		//		}
+		//	}
+		//})
 	}
 
 	if r.serverConns[targetNodeId] == nil {
@@ -446,7 +467,7 @@ func (r *Replica) handleViewChangeTimer() {
 	if r.status == ReplicaStatusRecovering {
 		return
 	}
-	if r.config.NodeId == r.primaryNode() { // skip view change if it is the primary node
+	if r.status == ReplicaStatusNormal && r.config.NodeId == r.primaryNode() { // skip view change if it is the primary node
 		return
 	}
 	r.initViewChange(r.viewId + 1)
@@ -550,12 +571,6 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 			// TODO: log this error
 		}
 	}
-
-	// update view change timer
-	primaryNodeId := r.primaryNode()
-	if primaryNodeId != r.config.NodeId && primaryNodeId == envelope.FromNodeId {
-		r.viewChangeTimer.Reset(r.config.ViewChangeDelayDuration)
-	}
 }
 
 func (r *Replica) handleRequest(request *Request) {
@@ -621,6 +636,30 @@ func (r *Replica) handleRequest(request *Request) {
 	r.lastCommitAt = r.tt.Now()
 }
 
+func (r *Replica) handleResendPrepares() {
+	if r.primaryNode() != r.config.NodeId {
+		return
+	}
+	if r.status != ReplicaStatusNormal {
+		return
+	}
+
+	for logId := r.commitId + 1; logId <= r.commitId+100 && logId <= r.lastLogId; logId++ {
+		entry := r.logs.At(r.commitId + 1)
+		r.broadcast(CmdTypePrepare, &Prepare{
+			ViewId:   r.viewId,
+			LogId:    entry.LogId,
+			CommitId: r.commitId,
+			ClientRequest: &Request{
+				ClientId:    entry.ClientId,
+				RequestId:   entry.RequestId,
+				RequestBody: entry.Body,
+			},
+		})
+		r.lastCommitAt = r.tt.Now()
+	}
+}
+
 func (r *Replica) handlePrepare(prepare *Prepare) (shouldAck bool) {
 	assert.Assert(prepare != nil, "prepare should not be nil")
 
@@ -634,6 +673,9 @@ func (r *Replica) handlePrepare(prepare *Prepare) (shouldAck bool) {
 		// already existed
 		return true
 	}
+
+	// reset view change timer since there's a message from primary node
+	r.viewChangeTimer.Reset(r.config.ViewChangeDelayDuration)
 
 	// backup to apply commit from h.lastLogId + 1 until prepare.CommitId
 	r.doCommit(prepare.CommitId, false)
@@ -692,6 +734,8 @@ func (r *Replica) handleCommit(commit *Commit) {
 		return
 	}
 
+	// reset view change timer since there's a message from primary node
+	r.viewChangeTimer.Reset(r.config.ViewChangeDelayDuration)
 	r.doCommit(commit.CommitId, false)
 }
 
@@ -774,7 +818,7 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 				bestCommitId = current.CommitId
 			}
 		}
-		// fmt.Printf("%v node:%d quorum check on view:%d size:%d, lagLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, doViewChange.ViewId, len(set), best.LastLogId, bestCommitId)
+		// fmt.Printf("%v node:%d quorum check on view:%d size:%d, lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, doViewChange.ViewId, len(set), best.LastLogId, bestCommitId)
 		// update state
 		r.replaceState(best.ViewId, best.LastLogId, bestCommitId, best.Logs, best.NodeId == r.config.NodeId)
 		if r.lastLogId > r.commitId {

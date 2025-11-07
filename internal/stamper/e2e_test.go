@@ -29,7 +29,7 @@ func TestSimulation(t *testing.T) {
 			NumServers: 3,
 			NumClients: 10,
 			ReplicaConfig: stamper.ReplicaConfig{
-				SendRetryDuration:       3 * time.Second,
+				SendRetryDuration:       500 * time.Millisecond,
 				CommitDelayDuration:     5 * time.Second,
 				ViewChangeDelayDuration: 10 * time.Second,
 				RecoveryRetryDuration:   10 * time.Second,
@@ -41,11 +41,11 @@ func TestSimulation(t *testing.T) {
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
-			MsgLossProb:          Fraction{1, 1000},
+			MsgLossProb:          Fraction{5, 1000},
 			CutOffProb:           Fraction{1, 1000},
 			CutOffMean:           10 * time.Second,
 			CutOffStdDev:         5 * time.Second,
-			RepairProb:           Fraction{5, 100},
+			RepairProb:           Fraction{0, 100},
 		})
 	})
 }
@@ -78,6 +78,7 @@ func initClient(serverAddrs []string, clientId uint64, tt timepkg.Time, createCo
 }
 
 type logHooks struct {
+	nodeId        int
 	prefixLogHash [][]byte
 	prefixHash    hash.Hash
 }
@@ -309,7 +310,7 @@ func newNetwork(config *SimulatorConfig, r *rand.Rand, tt *mockedTime) *network 
 	}
 	n.replicaLogHooks = make([]*logHooks, len(n.serverAddrs))
 	for i := range n.replicaLogHooks {
-		n.replicaLogHooks[i] = &logHooks{}
+		n.replicaLogHooks[i] = &logHooks{nodeId: i}
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	for i := range n.replicas {
@@ -399,19 +400,40 @@ func (n *network) propagate(finishing bool) {
 
 	// validate invariant: committed logs are in the majority of the replicas
 	for i, r1 := range n.replicas {
+		if r1.Status() != stamper.ReplicaStatusNormal {
+			continue
+		}
+
 		numLogPresent := 0
 		numRecovering := 0
 		for j, r2 := range n.replicas {
 			if r2.Status() == stamper.ReplicaStatusRecovering {
 				numRecovering++
 			}
+			// scenario:
+			//  r2 primary
+			//  r2 append(logId:1, L1), broadcast --> partitioned, too bad...
+			//  viewchange to r1
+			//  startview to r2 missed
+			//  r2 is back from partition with old view, and it think that it is still the primary->won't init viewchange
+			//  r1 append(logId:1, L2), broadcast..
 			if r2.LastLogId() >= r1.CommitId() {
 				numLogPresent++
 				if i != j {
 					// validate that all logs are the same <= r1.CommitId()
-					h1 := n.replicaLogHooks[i].prefixLogHash[r1.CommitId()]
-					h2 := n.replicaLogHooks[j].prefixLogHash[r1.CommitId()]
-					assert.Assertf(bytes.Equal(h1, h2), "Unequal prefix to commitId:%d of node %d and %d, expected:%x got: %x", r1.CommitId(), i, j, h1, h2)
+					commitId := r1.CommitId()
+					h1 := n.replicaLogHooks[i].prefixLogHash[commitId]
+					h2 := n.replicaLogHooks[j].prefixLogHash[commitId]
+					if r2.Status() == stamper.ReplicaStatusNormal && r1.ViewId() == r2.ViewId() {
+						assert.Assertf(
+							 bytes.Equal(h1, h2),
+							"Unequal prefix to commitId:%d of node n:%d,s:%d,v:%d,c:%d,l:%d and n:%d,s:%d,v:%d,c:%d,l:%d, expected:%x got: %x",
+							r1.CommitId(),
+							i, r1.Status(), r1.ViewId(), r1.CommitId(), r1.LastLogId(),
+							j, r2.Status(), r2.ViewId(), r2.CommitId(), r2.LastLogId(),
+							h1, h2,
+						)
+					}
 				}
 			}
 		}
@@ -583,7 +605,7 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 	states := []string{}
 	for i, r := range n.replicas {
 		// should eventually be in normal state
-		assert.Assertf(r.Status() == stamper.ReplicaStatusNormal, "Status wasn't normal, %d", r.Status())
+		assert.Assertf(r.Status() == stamper.ReplicaStatusNormal, "Status wasn't normal on node %d, %d", i, r.Status())
 		states = append(states, n.getReplicaState(i))
 		t.Logf("Replica %d, state: %s", i, states[i])
 	}
