@@ -51,7 +51,6 @@ const (
 	CmdTypeStartView        CmdType = 8
 	CmdTypeRecovery         CmdType = 9
 	CmdTypeRecoveryResponse CmdType = 10
-	CmdTypeAck              CmdType = 100
 )
 
 func (c CmdType) String() string {
@@ -76,8 +75,6 @@ func (c CmdType) String() string {
 		return "Recovery"
 	case CmdTypeRecoveryResponse:
 		return "RecoveryResponse"
-	case CmdTypeAck:
-		return "Ack"
 	default:
 		return "UNKNOWN"
 	}
@@ -156,14 +153,9 @@ type RecoveryResponse struct {
 	FromNodeId int          // source node-id
 }
 
-type Ack struct {
-	EnvelopeId uint64
-}
-
 // Envelope the envelope structure used for communications
 type Envelope struct {
 	Cmd        CmdType
 	FromNodeId int
-	EnvelopeId uint64
 	Payload    any
 }

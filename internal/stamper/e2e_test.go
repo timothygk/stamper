@@ -42,7 +42,7 @@ func TestSimulation(t *testing.T) {
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
 			MsgLossProb:          Fraction{5, 1000},
-			CutOffProb:           Fraction{1, 1000},
+			CutOffProb:           Fraction{10, 1000},
 			CutOffMean:           10 * time.Second,
 			CutOffStdDev:         5 * time.Second,
 			RepairProb:           Fraction{0, 100},
@@ -417,6 +417,7 @@ func (n *network) propagate(finishing bool) {
 			//  startview to r2 missed
 			//  r2 is back from partition with old view, and it think that it is still the primary->won't init viewchange
 			//  r1 append(logId:1, L2), broadcast..
+			//     -> even if startview is retried, some prepare requests are dropped as well...
 			if r2.LastLogId() >= r1.CommitId() {
 				numLogPresent++
 				if i != j {

@@ -15,12 +15,10 @@ func (JsonEncoderDecoder) Encode(w io.Writer, msg *Envelope) error {
 	return json.NewEncoder(w).Encode(struct {
 		Cmd        CmdType `json:"cmd"`
 		FromNodeId int     `json:"from_node_id"`
-		EnvelopeId uint64  `json:"envelope_id"`
 		Payload    any     `json:"payload"`
 	}{
 		Cmd:        msg.Cmd,
 		FromNodeId: msg.FromNodeId,
-		EnvelopeId: msg.EnvelopeId,
 		Payload:    msg.Payload,
 	})
 }
@@ -29,7 +27,6 @@ func (JsonEncoderDecoder) Decode(r io.Reader) (*Envelope, error) {
 	msg := struct {
 		Cmd        CmdType         `json:"cmd"`
 		FromNodeId int             `json:"from_node_id"`
-		EnvelopeId uint64          `json:"envelope_id"`
 		Payload    json.RawMessage `json:"payload"`
 	}{}
 
@@ -41,7 +38,6 @@ func (JsonEncoderDecoder) Decode(r io.Reader) (*Envelope, error) {
 	envelope := &Envelope{
 		Cmd:        msg.Cmd,
 		FromNodeId: msg.FromNodeId,
-		EnvelopeId: msg.EnvelopeId,
 	}
 
 	switch msg.Cmd {
@@ -65,8 +61,6 @@ func (JsonEncoderDecoder) Decode(r io.Reader) (*Envelope, error) {
 		envelope.Payload = &Recovery{}
 	case CmdTypeRecoveryResponse:
 		envelope.Payload = &RecoveryResponse{}
-	case CmdTypeAck:
-		envelope.Payload = &Ack{}
 	default:
 		return nil, ErrUnknownCmdType
 	}
@@ -86,7 +80,6 @@ func (e *Envelope) JsonStr() string {
 	enc.Encode(map[string]any{
 		"Cmd":        e.Cmd.String(),
 		"FromNodeId": e.FromNodeId,
-		"EnvelopeId": e.EnvelopeId,
 		"Payload":    e.Payload,
 	})
 	buf.Truncate(buf.Len() - 1)
