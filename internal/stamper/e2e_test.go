@@ -118,7 +118,16 @@ func (t *mockedTimer) Reset(d time.Duration) bool {
 
 type mockedTicker struct {
 	ch      chan time.Time
-	failCnt int
+	stopped bool
+}
+
+func (t *mockedTicker) Chan() <-chan time.Time {
+	return t.ch
+}
+
+func (t *mockedTicker) Stop() {
+	t.stopped = true
+	close(t.ch)
 }
 
 type mockedTime struct {
@@ -136,26 +145,25 @@ func (t *mockedTime) AfterFunc(d time.Duration, f func()) timepkg.Timer {
 	return t.makeTimer(d, f)
 }
 
-func (t *mockedTime) Tick(d time.Duration) <-chan time.Time {
+func (t *mockedTime) Tick(d time.Duration) timepkg.Ticker {
 	ticker := &mockedTicker{
 		ch:      make(chan time.Time),
-		failCnt: 0,
+		stopped: false,
 	}
 	var f func()
 	f = func() {
 		// ch <- t.now
+		if ticker.stopped {
+			return
+		}
 		if reflect.ValueOf(ticker.ch).TrySend(reflect.ValueOf(t.now)) {
-			ticker.failCnt = 0
-		} else {
-			ticker.failCnt++
+			synctest.Wait()
 		}
-		if ticker.failCnt <= 10 {
-			t.makeTimer(d, f)
-		}
+		t.makeTimer(d, f)
 	}
 	t.makeTimer(d, f)
 	t.tickers = append(t.tickers, ticker)
-	return ticker.ch
+	return ticker
 }
 
 func (t *mockedTime) makeTimer(d time.Duration, fn func()) *mockedTimer {
@@ -203,22 +211,13 @@ func (t *mockedTime) advanceTime(d time.Duration) {
 	// cleanup tickers
 	lastIndex = len(t.tickers) - 1
 	for i := lastIndex; i >= 0; i-- {
-		if t.tickers[i].failCnt > 10 {
-			// heuristic here
-			close(t.tickers[i].ch)
+		if t.tickers[i].stopped {
 			t.tickers[i] = t.tickers[lastIndex]
 			t.tickers[lastIndex] = nil // remove reference
 			lastIndex--
 		}
 	}
 	t.tickers = t.tickers[:lastIndex+1]
-}
-
-func (t *mockedTime) close() error {
-	for _, ticker := range t.tickers {
-		close(ticker.ch)
-	}
-	return nil
 }
 
 type payload struct {
@@ -335,10 +334,7 @@ func (n *network) isPartitioned(idx int) bool {
 func (n *network) partition() {
 	numPartitioned := 0
 	for i := range n.serverCutOff {
-		if n.isPartitioned(i) {
-			numPartitioned++
-		}
-		if n.replicas[i].Status() == stamper.ReplicaStatusRecovering {
+		if n.isPartitioned(i) || n.replicas[i].Status() == stamper.ReplicaStatusRecovering {
 			numPartitioned++
 		}
 	}
@@ -349,7 +345,7 @@ func (n *network) partition() {
 		numPartitioned++
 	}
 
-	assert.Assertf(numPartitioned*2+1 <= len(n.serverAddrs), "Partition constrain breached, num:%d total:%d", numPartitioned, len(n.serverAddrs))
+	assert.Assertf(numPartitioned*2+1 <= len(n.serverAddrs), "Partition constraint breached, num:%d total:%d", numPartitioned, len(n.serverAddrs))
 
 	// trigger repair
 	for i := range n.replicas {
@@ -404,7 +400,11 @@ func (n *network) propagate(finishing bool) {
 	// validate invariant: committed logs are in the majority of the replicas
 	for i, r1 := range n.replicas {
 		numLogPresent := 0
+		numRecovering := 0
 		for j, r2 := range n.replicas {
+			if r2.Status() == stamper.ReplicaStatusRecovering {
+				numRecovering++
+			}
 			if r2.LastLogId() >= r1.CommitId() {
 				numLogPresent++
 				if i != j {
@@ -415,12 +415,18 @@ func (n *network) propagate(finishing bool) {
 				}
 			}
 		}
-		assert.Assertf(
-			numLogPresent*2-1 >= n.config.NumServers,
-			"Commit is not present to majority of the nodes, node:%d commitId:%d",
-			i,
-			r1.CommitId(),
-		)
+
+		if numRecovering == 0 {
+			// if max committed was on primary and another replica, while another one is lagging due to network,
+			// and then restart recovery triggered on the primary node then the max committed is only on one replica.
+			assert.Assertf(
+				numLogPresent*2-1 >= n.config.NumServers,
+				"Commit is not present to majority of the nodes, node:%d commitId:%d numLogPresent:%d",
+				i,
+				r1.CommitId(),
+				numLogPresent,
+			)
+		}
 	}
 
 	// validate invariant: no split brain
@@ -552,7 +558,7 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 
 		if tickCnt%100000 == 0 {
 			t.Logf(
-				"At tick %d, timers:%d timerchans:%d managedconn:%d numGoroutines=%d",
+				"At tick %d, timers:%d tickers:%d managedconn:%d numGoroutines=%d",
 				tickCnt,
 				len(tt.timers),
 				len(tt.tickers),
@@ -575,14 +581,16 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 	}
 
 	states := []string{}
-	for i := range n.replicas {
+	for i, r := range n.replicas {
+		// should eventually be in normal state
+		assert.Assertf(r.Status() == stamper.ReplicaStatusNormal, "Status wasn't normal, %d", r.Status())
 		states = append(states, n.getReplicaState(i))
 		t.Logf("Replica %d, state: %s", i, states[i])
 	}
 	for i := range len(states) - 1 {
 		assert.Assertf(
 			states[i] == states[i+1],
-			"State of replica %d and %d is not equal\n\t%s\n\t\tvs\n\t%s",
+			"Final state of replica %d and %d is not equal\n\t%s\n\t\tvs\n\t%s",
 			i,
 			i+1,
 			states[i],
@@ -591,15 +599,13 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 	}
 
 	// close resources
-	tt.close()
 	for i, c := range n.clients {
 		assert.Assertf(c.Close() == nil, "Should successfully close client %d", i)
-		//synctest.Wait()
+		synctest.Wait()
 	}
 	for i, r := range n.replicas {
 		assert.Assertf(r.Close() == nil, "Should successfully close replica %d", i)
-		//synctest.Wait()
+		synctest.Wait()
 	}
-	synctest.Wait()
 	t.Logf("Completed simulation at %v\n", tt.now)
 }

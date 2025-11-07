@@ -138,11 +138,12 @@ func (c *Client) Request(body []byte) ([]byte, error) {
 	c.send(int(c.viewId%uint64(len(c.config.ServerAddrs))), request)
 
 	retryTicker := c.tt.Tick(c.config.RetryDuration)
+	defer retryTicker.Stop()
 
 	// wait for reply...
 	for {
 		select {
-		case <-retryTicker:
+		case <-retryTicker.Chan():
 			// broadcast
 			for i := range c.config.ServerAddrs {
 				c.send(i, request)

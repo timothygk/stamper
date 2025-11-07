@@ -228,9 +228,10 @@ func (r *Replica) Close() error {
 
 func (r *Replica) heartbeatLoop() {
 	ticker := r.tt.Tick(r.config.CommitDelayDuration)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-ticker:
+		case <-ticker.Chan():
 			r.events <- event{etype: eventTypeHeartbeatCommit}
 		case <-r.closing:
 			return

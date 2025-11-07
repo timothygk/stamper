@@ -10,11 +10,30 @@ type Timer interface {
 	Reset(d time.Duration) bool
 }
 
+type Ticker interface {
+	// Chan the channel to read time
+	Chan() <-chan time.Time
+	// Stop stop the ticker
+	Stop()
+}
+
+type realTicker struct {
+	ticker *time.Ticker
+}
+
+func (t realTicker) Chan() <-chan time.Time {
+	return t.ticker.C
+}
+
+func (t realTicker) Stop() {
+	t.ticker.Stop()
+}
+
 // Time the main time interface
 type Time interface {
 	Now() time.Time
 	AfterFunc(d time.Duration, f func()) Timer
-	Tick(d time.Duration) <-chan time.Time
+	Tick(d time.Duration) Ticker
 }
 
 // NewTime create a new Time
@@ -32,6 +51,6 @@ func (realTimePkg) AfterFunc(d time.Duration, f func()) Timer {
 	return time.AfterFunc(d, f)
 }
 
-func (realTimePkg) Tick(d time.Duration) <-chan time.Time {
-	return time.Tick(d)
+func (realTimePkg) Tick(d time.Duration) Ticker {
+	return realTicker{time.NewTicker(d)}
 }
