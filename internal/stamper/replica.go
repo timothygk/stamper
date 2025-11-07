@@ -1,7 +1,6 @@
 package stamper
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -21,13 +20,6 @@ const (
 	ReplicaStatusViewChange replicaStatus = 2
 	ReplicaStatusRecovering replicaStatus = 3
 )
-
-type logEntry struct {
-	LogId     uint64
-	ClientId  uint64
-	RequestId uint64
-	Body      []byte
-}
 
 type clientTable struct {
 	requestId uint64 // last request-number
@@ -119,7 +111,7 @@ type Replica struct {
 	viewId    uint64
 	status    replicaStatus
 	lastLogId uint64
-	logs      []logEntry
+	logs      *Logs
 	commitId  uint64
 	clients   map[uint64]*clientTable
 	upcall    func([]byte) []byte
@@ -149,6 +141,7 @@ func NewReplica(
 	createConn func(string) (net.Conn, error),
 	r *rand.Rand,
 	upcall func([]byte) []byte,
+	logHooks LogHooks,
 	recovery bool,
 ) *Replica {
 	replica := &Replica{
@@ -165,7 +158,7 @@ func NewReplica(
 		viewId:            0,
 		status:            ReplicaStatusNormal,
 		lastLogId:         0,
-		logs:              make([]logEntry, 0, 1000),
+		logs:              newLogs(logHooks),
 		commitId:          0,
 		clients:           make(map[uint64]*clientTable),
 		upcall:            upcall,
@@ -196,23 +189,20 @@ func NewReplica(
 	return replica
 }
 
-// GetState get the replica state to compare with another state
-func (r *Replica) GetState() string {
-	h := sha256.New()
-	for i := range r.logs {
-		h.Write(r.logs[i].Body)
-	}
-	return fmt.Sprintf("status:%d, viewId:%d, commitId:%d, lastLogId:%d, loghash:%x",
-		r.status,
-		r.viewId,
-		r.commitId,
-		r.lastLogId,
-		h.Sum(nil),
-	)
-}
-
 func (r *Replica) Status() replicaStatus {
 	return r.status
+}
+
+func (r *Replica) ViewId() uint64 {
+	return r.viewId
+}
+
+func (r *Replica) CommitId() uint64 {
+	return r.commitId
+}
+
+func (r *Replica) LastLogId() uint64 {
+	return r.lastLogId
 }
 
 // Accept accept a network connection
@@ -731,13 +721,7 @@ func (r *Replica) handleStartViewChange(startViewChange *StartViewChange) {
 			r.handleDoViewChange(doViewChange)
 		} else {
 			// copy logs
-			doViewChange.Logs = make([]RequestLog, len(r.logs))
-			for i := range r.logs {
-				doViewChange.Logs[i].ClientId = r.logs[i].ClientId
-				doViewChange.Logs[i].RequestId = r.logs[i].RequestId
-				doViewChange.Logs[i].LogId = r.logs[i].LogId
-				doViewChange.Logs[i].Body = r.logs[i].Body
-			}
+			doViewChange.Logs = r.logs.CopyLogs()
 			r.sendTo(nextPrimaryId, CmdTypeDoViewChange, doViewChange)
 		}
 	}
@@ -798,7 +782,7 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 		// broadcast start view
 		logs := best.Logs
 		if best.NodeId == r.config.NodeId { // late copy of the logs
-			logs = r.copyLogs()
+			logs = r.logs.CopyLogs()
 		}
 		r.broadcast(CmdTypeStartView, &StartView{
 			ViewId:    r.viewId,
@@ -856,7 +840,7 @@ func (r *Replica) handleRecovery(recovery *Recovery) {
 		FromNodeId: r.config.NodeId,
 	}
 	if r.primaryNode() == r.config.NodeId {
-		response.Logs = r.copyLogs()
+		response.Logs = r.logs.CopyLogs()
 		response.LastLogId = r.lastLogId
 		response.CommitId = r.commitId
 	}
@@ -917,13 +901,7 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 
 	if !sameNode {
 		// copy logs
-		r.logs = make([]logEntry, len(logs))
-		for i := range logs {
-			r.logs[i].ClientId = logs[i].ClientId
-			r.logs[i].RequestId = logs[i].RequestId
-			r.logs[i].LogId = logs[i].LogId
-			r.logs[i].Body = logs[i].Body
-		}
+		r.logs.Replace(logs)
 	}
 
 	// commit
@@ -939,10 +917,9 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 
 	// update client table
 	for logId := r.commitId + 1; logId <= r.lastLogId; logId++ {
-		index := int(logId) - 1
-		assert.Assertf(r.logs[index].LogId == logId, "Logs array should be ordered correctly, expected %d, found %d", logId, r.logs[index].LogId)
-		r.clients[r.logs[index].ClientId] = &clientTable{
-			requestId: r.logs[index].RequestId,
+		entry := r.logs.At(logId)
+		r.clients[entry.ClientId] = &clientTable{
+			requestId: entry.RequestId,
 			reply:     nil,
 		}
 	}
@@ -960,14 +937,8 @@ func (r *Replica) primaryNode() int {
 }
 
 func (r *Replica) appendLog(request *Request) {
-	assert.Assertf(
-		uint64(len(r.logs)) == r.lastLogId,
-		"Last log id should match len, found len:%d lastLogId:%d",
-		len(r.logs),
-		r.lastLogId,
-	)
 	r.lastLogId++
-	r.logs = append(r.logs, logEntry{
+	r.logs.Append(LogEntry{
 		LogId:     r.lastLogId,
 		ClientId:  request.ClientId,
 		RequestId: request.RequestId,
@@ -977,17 +948,6 @@ func (r *Replica) appendLog(request *Request) {
 		requestId: request.RequestId,
 		reply:     nil,
 	}
-}
-
-func (r *Replica) copyLogs() []RequestLog {
-	logs := make([]RequestLog, len(r.logs))
-	for i := range len(r.logs) {
-		logs[i].ClientId = r.logs[i].ClientId
-		logs[i].RequestId = r.logs[i].RequestId
-		logs[i].LogId = r.logs[i].LogId
-		logs[i].Body = r.logs[i].Body
-	}
-	return logs
 }
 
 func (r *Replica) quorumAddPrepareOk(logId uint64, nodeId int) uint64 {
@@ -1007,23 +967,22 @@ func (r *Replica) doCommit(toCommitId uint64, sendReply bool) {
 		toCommitId = r.lastLogId
 	}
 	for logId := r.commitId + 1; logId <= toCommitId; logId++ {
-		index := int(logId) - 1
 		// upcall & commit
-		assert.Assertf(r.logs[index].LogId == logId, "Logs array should be ordered correctly, expected %d, found %d", logId, r.logs[index].LogId)
-		responseBody := r.upcall(r.logs[index].Body)
+		entry := r.logs.At(logId)
+		responseBody := r.upcall(entry.Body)
 		r.commitId = logId
 		// update client table
 		reply := &Reply{
 			ViewId:       r.viewId,
-			RequestId:    r.logs[index].RequestId,
+			RequestId:    entry.RequestId,
 			ResponseBody: responseBody,
 		}
-		r.clients[r.logs[index].ClientId] = &clientTable{
-			requestId: r.logs[index].RequestId,
+		r.clients[entry.ClientId] = &clientTable{
+			requestId: entry.RequestId,
 			reply:     reply,
 		}
 		if sendReply {
-			r.sendReply(r.logs[index].ClientId, reply)
+			r.sendReply(entry.ClientId, reply)
 		}
 	}
 }

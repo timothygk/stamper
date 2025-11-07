@@ -64,10 +64,17 @@ func main() {
 		CreateTcpConnection,
 		r,
 		func(body []byte) []byte { return append(body, []byte("_SUFFIXED")...) },
+		nil,
 		false,
 	)
 	defer func() {
-		fmt.Printf("Final state %s\n", replica.GetState())
+		fmt.Printf("Final state status:%d, viewId:%d, commitId:%d, lastLogId:%d\n",
+			replica.Status(),
+			replica.ViewId(),
+			replica.CommitId(),
+			replica.LastLogId(),
+			// TODO: add log hash
+		)
 	}()
 
 	// init tcp server

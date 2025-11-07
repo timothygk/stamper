@@ -32,5 +32,5 @@ Simulation testing
 - [ ] CI to run simulation with random configurations
 - [x] reply correctness check
 - [x] eventually ended in the same state check
-- [ ] message loss check
-- [ ] split brain check
+- [x] message loss check
+- [x] split brain check

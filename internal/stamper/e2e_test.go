@@ -2,8 +2,10 @@ package stamper_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"math/rand/v2"
@@ -73,6 +75,21 @@ func initClient(serverAddrs []string, clientId uint64, tt timepkg.Time, createCo
 		stamper.JsonEncoderDecoder{},
 		createConn,
 	)
+}
+
+type logHooks struct {
+	prefixLogHash [][]byte
+	prefixHash    hash.Hash
+}
+
+func (h *logHooks) OnInit() {
+	h.prefixHash = sha256.New()
+	h.prefixLogHash = [][]byte{h.prefixHash.Sum(nil)}
+}
+
+func (h *logHooks) OnAppend(entry *stamper.LogEntry) {
+	h.prefixHash.Write(entry.Body)
+	h.prefixLogHash = append(h.prefixLogHash, h.prefixHash.Sum(nil))
 }
 
 type mockedTimer struct {
@@ -270,15 +287,16 @@ type SimulatorConfig struct {
 }
 
 type network struct {
-	config       *SimulatorConfig
-	r            *rand.Rand
-	tt           *mockedTime
-	serverAddrs  []string
-	replicas     []*stamper.Replica
-	clientAddrs  []string
-	clients      []*client.Client
-	conns        []*conn
-	serverCutOff []time.Time
+	config          *SimulatorConfig
+	r               *rand.Rand
+	tt              *mockedTime
+	serverAddrs     []string
+	replicas        []*stamper.Replica
+	replicaLogHooks []*logHooks
+	clientAddrs     []string
+	clients         []*client.Client
+	conns           []*conn
+	serverCutOff    []time.Time
 }
 
 func newNetwork(config *SimulatorConfig, r *rand.Rand, tt *mockedTime) *network {
@@ -289,6 +307,10 @@ func newNetwork(config *SimulatorConfig, r *rand.Rand, tt *mockedTime) *network 
 		serverAddrs:  iotaWithPrefix("server", config.NumServers, 0),
 		clientAddrs:  iotaWithPrefix("client", config.NumClients, 0),
 		serverCutOff: make([]time.Time, config.NumServers),
+	}
+	n.replicaLogHooks = make([]*logHooks, len(n.serverAddrs))
+	for i := range n.replicaLogHooks {
+		n.replicaLogHooks[i] = &logHooks{}
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	for i := range n.replicas {
@@ -378,6 +400,42 @@ func (n *network) propagate(finishing bool) {
 			continue
 		}
 	}
+
+	// validate invariant: committed logs are in the majority of the replicas
+	for i, r1 := range n.replicas {
+		numLogPresent := 0
+		for j, r2 := range n.replicas {
+			if r2.LastLogId() >= r1.CommitId() {
+				numLogPresent++
+				if i != j {
+					// validate that all logs are the same <= r1.CommitId()
+					h1 := n.replicaLogHooks[i].prefixLogHash[r1.CommitId()]
+					h2 := n.replicaLogHooks[j].prefixLogHash[r1.CommitId()]
+					assert.Assertf(bytes.Equal(h1, h2), "Unequal prefix to commitId:%d of node %d and %d, expected:%x got: %x", r1.CommitId(), i, j, h1, h2)
+				}
+			}
+		}
+		assert.Assertf(
+			numLogPresent*2-1 >= n.config.NumServers,
+			"Commit is not present to majority of the nodes, node:%d commitId:%d",
+			i,
+			r1.CommitId(),
+		)
+	}
+
+	// validate invariant: no split brain
+	for i, r1 := range n.replicas {
+		for j, r2 := range n.replicas {
+			if i >= j {
+				continue
+			}
+			// validate that intersecting committed logs are the same
+			minCommitId := min(r1.CommitId(), r2.CommitId())
+			h1 := n.replicaLogHooks[i].prefixLogHash[minCommitId]
+			h2 := n.replicaLogHooks[j].prefixLogHash[minCommitId]
+			assert.Assertf(bytes.Equal(h1, h2), "Unequal prefix to logId:%d of node %d and %d, expected:%x got: %x", minCommitId, i, j, h1, h2)
+		}
+	}
 }
 
 func (n *network) createConnFunc(srcAddr string) func(string) (net.Conn, error) {
@@ -433,7 +491,18 @@ func (n *network) createReplica(i int, repair bool) *stamper.Replica {
 		n.createConnFunc(n.serverAddrs[i]),
 		rand.New(rand.NewPCG(n.r.Uint64(), n.r.Uint64())),
 		func(body []byte) []byte { return append(body, []byte("_SUFFIXED")...) },
+		n.replicaLogHooks[i],
 		repair,
+	)
+}
+
+func (n *network) getReplicaState(i int) string {
+	return fmt.Sprintf("status:%d, viewId:%d, commitId:%d, lastLogId:%d, loghash:%x",
+		n.replicas[i].Status(),
+		n.replicas[i].ViewId(),
+		n.replicas[i].CommitId(),
+		n.replicas[i].LastLogId(),
+		n.replicaLogHooks[i].prefixHash.Sum(nil),
 	)
 }
 
@@ -494,8 +563,8 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 		tickCnt++
 	}
 
-	for i, r := range n.replicas {
-		t.Logf("Replica %d, state: %s", i, r.GetState())
+	for i := range n.replicas {
+		t.Logf("Replica %d, state: %s", i, n.getReplicaState(i))
 	}
 	t.Logf("Cleanup loop at %v...", tt.now)
 
@@ -506,8 +575,8 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 	}
 
 	states := []string{}
-	for i, r := range n.replicas {
-		states = append(states, r.GetState())
+	for i := range n.replicas {
+		states = append(states, n.getReplicaState(i))
 		t.Logf("Replica %d, state: %s", i, states[i])
 	}
 	for i := range len(states) - 1 {
