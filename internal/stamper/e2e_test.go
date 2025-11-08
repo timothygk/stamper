@@ -25,7 +25,7 @@ func TestSimulation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		simulate(t, &SimulatorConfig{
 			NumServers: 3,
-			NumClients: 10,
+			NumClients: 30,
 			ReplicaConfig: stamper.ReplicaConfig{
 				SendRetryDuration:       500 * time.Millisecond,
 				CommitDelayDuration:     5 * time.Second,
@@ -34,13 +34,13 @@ func TestSimulation(t *testing.T) {
 			},
 			Seed1:                123123582,
 			Seed2:                45679445584,
-			RequestPerTick:       3,
-			NumTicks:             1000000,
+			RequestPerTick:       1,
+			NumTicks:             10000000,
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
 			MsgLossProb:          Fraction{5, 1000},
-			CutOffProb:           Fraction{15, 1000},
+			CutOffProb:           Fraction{155, 1000},
 			CutOffMean:           10 * time.Second,
 			CutOffStdDev:         5 * time.Second,
 			RepairProb:           Fraction{5, 100},
@@ -405,31 +405,20 @@ func (n *network) propagate(finishing bool) {
 			if r2.Status() == stamper.ReplicaStatusRecovering {
 				numRecovering++
 			}
-			// scenario:
-			//  r2 primary
-			//  r2 append(logId:1, L1), broadcast --> partitioned, too bad...
-			//  viewchange to r1
-			//  startview to r2 missed
-			//  r2 is back from partition with old view, and it think that it is still the primary->won't init viewchange
-			//  r1 append(logId:1, L2), broadcast..
-			//     -> even if startview is retried, some prepare requests are dropped as well...
 			if r2.LastLogId() >= r1.CommitId() {
 				numLogPresent++
-				if i != j {
+				if i != j && r2.Status() == stamper.ReplicaStatusNormal && r1.ViewId() == r2.ViewId() {
 					// validate that all logs are the same <= r1.CommitId()
-					if r2.Status() == stamper.ReplicaStatusNormal && r1.ViewId() == r2.ViewId() {
-						commitId := r1.CommitId()
-						h1 := r1.LogHash(commitId)
-						h2 := r2.LogHash(commitId)
-						assert.Assertf(
-							bytes.Equal(h1, h2),
-							"Unequal prefix to commitId:%d of node n:%d,s:%d,v:%d,c:%d,l:%d and n:%d,s:%d,v:%d,c:%d,l:%d, expected:%x got: %x",
-							r1.CommitId(),
-							i, r1.Status(), r1.ViewId(), r1.CommitId(), r1.LastLogId(),
-							j, r2.Status(), r2.ViewId(), r2.CommitId(), r2.LastLogId(),
-							h1, h2,
-						)
-					}
+					h1 := r1.LogHash(r1.CommitId())
+					h2 := r2.LogHash(r1.CommitId())
+					assert.Assertf(
+						bytes.Equal(h1, h2),
+						"Unequal prefix to commitId:%d of node n:%d,s:%d,v:%d,c:%d,l:%d and n:%d,s:%d,v:%d,c:%d,l:%d, expected:%x got: %x",
+						r1.CommitId(),
+						i, r1.Status(), r1.ViewId(), r1.CommitId(), r1.LastLogId(),
+						j, r2.Status(), r2.ViewId(), r2.CommitId(), r2.LastLogId(),
+						h1, h2,
+					)
 				}
 			}
 		}
@@ -439,7 +428,7 @@ func (n *network) propagate(finishing bool) {
 			// and then restart recovery triggered on the primary node then the max committed is only on one replica.
 			assert.Assertf(
 				numLogPresent*2-1 >= n.config.NumServers,
-				"Commit is not present to majority of the nodes, node:%d commitId:%d numLogPresent:%d",
+				"Committed log is not present to majority of the nodes, node:%d commitId:%d numLogPresent:%d",
 				i,
 				r1.CommitId(),
 				numLogPresent,
@@ -573,7 +562,7 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 		n.propagate(false)              // propagate network messages
 		tt.advanceTime(config.TickStep) // advance time
 
-		if tickCnt%100000 == 0 {
+		if tickCnt%1000000 == 0 {
 			t.Logf(
 				"At tick %d, timers:%d tickers:%d managedconn:%d numGoroutines=%d",
 				tickCnt,

@@ -953,9 +953,19 @@ func (r *Replica) handleNewState(newState *NewState) {
 		assert.Assert(bytes.Equal(entry.Body, requestLog.Body), "bytes should be equal")
 	}
 
-	r.lastLogId = newState.LastLogId
-	r.logs.Replace(newLogs)
-	r.logs.TruncateFrom(r.lastLogId + 1) // in case old primary have seen a new view
+	// update viewId & lastLogId
+	if r.viewId < newState.ViewId {
+		r.viewId = newState.ViewId
+		if r.status == ReplicaStatusNormal {
+			r.lastNormalViewId = r.viewId
+		}
+		r.lastLogId = newState.LastLogId
+		r.logs.Replace(newLogs)
+		r.logs.TruncateFrom(r.lastLogId + 1) // in case old primary have seen a new view
+	} else if r.viewId == newState.ViewId && r.lastLogId < newState.LastLogId {
+		r.lastLogId = newState.LastLogId
+		r.logs.Replace(newLogs)
+	}
 
 	// update view
 	r.viewId = newState.ViewId
