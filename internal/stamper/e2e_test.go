@@ -25,7 +25,7 @@ func TestSimulation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		simulate(t, &SimulatorConfig{
 			NumServers: 3,
-			NumClients: 10,
+			NumClients: 100,
 			ReplicaConfig: stamper.ReplicaConfig{
 				SendRetryDuration:       500 * time.Millisecond,
 				CommitDelayDuration:     5 * time.Second,
@@ -39,8 +39,8 @@ func TestSimulation(t *testing.T) {
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
-			MsgLossProb:          Fraction{1, 1000},
-			CutOffProb:           Fraction{1, 1000},
+			MsgLossProb:          Fraction{100, 1000},
+			CutOffProb:           Fraction{100, 1000},
 			CutOffMean:           10 * time.Second,
 			CutOffStdDev:         5 * time.Second,
 			RepairProb:           Fraction{5, 100},
@@ -302,25 +302,29 @@ func newNetwork(config *SimulatorConfig, r *rand.Rand, tt *mockedTime) *network 
 	return &n
 }
 
-func (n *network) isPartitioned(idx int) bool {
+func (n *network) isPartitioned(idx int, at time.Time) bool {
 	if idx >= len(n.serverAddrs) {
 		return false
 	}
-	return n.serverCutOff[idx].After(n.tt.now)
+	return n.serverCutOff[idx].After(at)
+}
+
+func (n *network) canPartition(numPartitioned int) bool {
+	return numPartitioned*2+1 < len(n.serverAddrs)
 }
 
 func (n *network) partition() {
 	numPartitioned := 0
 	for i := range n.serverCutOff {
-		if n.isPartitioned(i) || n.replicas[i].Status() == stamper.ReplicaStatusRecovering {
+		if n.isPartitioned(i, n.tt.now) || n.replicas[i].Status() == stamper.ReplicaStatusRecovering {
 			numPartitioned++
 		}
 	}
-	if numPartitioned*2+1 < len(n.serverAddrs) && flipCoin(n.r, n.config.CutOffProb) {
+	if n.canPartition(numPartitioned) && flipCoin(n.r, n.config.CutOffProb) {
 		serverId := n.r.IntN(len(n.serverAddrs))
 		dur := logNormDuration(n.r, n.config.CutOffMean, n.config.CutOffStdDev, time.Second)
 		n.serverCutOff[serverId] = n.tt.now.Add(dur)
-		// fmt.Printf("[%v] Partition n:%d duration:%v until:%v\n", n.tt.now, serverId, dur, n.serverCutOff[serverId])
+		// fmt.Printf("[%v] Partition n:%d duration:%v until:%v, cutoffs:%v\n", n.tt.now, serverId, dur, n.serverCutOff[serverId], n.serverCutOff)
 		numPartitioned++
 	}
 
@@ -328,8 +332,12 @@ func (n *network) partition() {
 
 	// trigger repair
 	for i := range n.replicas {
-		if !n.isPartitioned(i) && n.serverCutOff[i].After(n.tt.now.Add(-n.config.TickStep)) && flipCoin(n.r, n.config.RepairProb) {
-			// trigger repair
+		if n.canPartition(numPartitioned) {
+			continue
+		}
+		nextTickAt := n.tt.now.Add(n.config.TickStep)
+		if n.isPartitioned(i, n.tt.now) && !n.isPartitioned(i, nextTickAt) && flipCoin(n.r, n.config.RepairProb) {
+			// repair exactly at the last tick it got partitioned
 			assert.Assertf(n.replicas[i].Close() == nil, "Should be able to close replica %d", i)
 			n.replicas[i] = n.createReplica(i, true)
 			synctest.Wait()
@@ -347,7 +355,7 @@ func (n *network) propagate(finishing bool) {
 			}
 
 			n.tt.makeTimer(dur, func() {
-				if n.isPartitioned(conn.dstIdx) {
+				if n.isPartitioned(conn.dstIdx, n.tt.now) {
 					conn.Close()
 					synctest.Wait()
 				}
@@ -473,7 +481,7 @@ func (n *network) createConnFunc(srcAddr string) func(string) (net.Conn, error) 
 
 		assert.Assertf(dstIdx >= 0, "Unknown dstAddr:%s from srcAddr:%s", dstAddr, srcAddr)
 
-		if n.isPartitioned(dstIdx) {
+		if n.isPartitioned(dstIdx, n.tt.now) {
 			return nil, io.EOF
 		}
 
@@ -552,7 +560,7 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 			}()
 			synctest.Wait()
 		}
-		n.partition()                   // network partition
+		n.partition()                   // network partition, including repair
 		n.propagate(false)              // propagate network messages
 		tt.advanceTime(config.TickStep) // advance time
 
