@@ -29,10 +29,10 @@ Simulation testing
   - [x] message loss
   - [x] simple network partition
   - [ ] more complex network partition
-- [ ] CI to run simulation with random configurations
-- [x] invariants
+- [ ] invariants
   - [x] reply correctness check
   - [x] eventually ended in the same state check
   - [x] message loss check
   - [x] split brain check
 - [ ] simulation config fuzzer
+- [ ] CI to run simulation with random configurations

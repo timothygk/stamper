@@ -269,25 +269,27 @@ type SimulatorConfig struct {
 }
 
 type network struct {
-	config          *SimulatorConfig
-	r               *rand.Rand
-	tt              *mockedTime
-	serverAddrs     []string
-	replicas        []*stamper.Replica
-	clientAddrs     []string
-	clients         []*client.Client
-	conns           []*conn
-	serverCutOff    []time.Time
+	config         *SimulatorConfig
+	r              *rand.Rand
+	tt             *mockedTime
+	serverAddrs    []string
+	replicas       []*stamper.Replica
+	clientAddrs    []string
+	clients        []*client.Client
+	conns          []*conn
+	serverCutOffFr []time.Time
+	serverCutOffTo []time.Time
 }
 
 func newNetwork(config *SimulatorConfig, r *rand.Rand, tt *mockedTime) *network {
 	n := network{
-		config:       config,
-		r:            rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
-		tt:           tt,
-		serverAddrs:  iotaWithPrefix("server", config.NumServers, 0),
-		clientAddrs:  iotaWithPrefix("client", config.NumClients, 0),
-		serverCutOff: make([]time.Time, config.NumServers),
+		config:         config,
+		r:              rand.New(rand.NewPCG(r.Uint64(), r.Uint64())),
+		tt:             tt,
+		serverAddrs:    iotaWithPrefix("server", config.NumServers, 0),
+		clientAddrs:    iotaWithPrefix("client", config.NumClients, 0),
+		serverCutOffFr: make([]time.Time, config.NumServers),
+		serverCutOffTo: make([]time.Time, config.NumServers),
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	for i := range n.replicas {
@@ -306,7 +308,7 @@ func (n *network) isPartitioned(idx int, at time.Time) bool {
 	if idx >= len(n.serverAddrs) {
 		return false
 	}
-	return n.serverCutOff[idx].After(at)
+	return !n.serverCutOffFr[idx].After(at) && n.serverCutOffTo[idx].After(at) // from <= at < to
 }
 
 func (n *network) canPartition(numPartitioned int) bool {
@@ -315,7 +317,7 @@ func (n *network) canPartition(numPartitioned int) bool {
 
 func (n *network) partition() {
 	numPartitioned := 0
-	for i := range n.serverCutOff {
+	for i := range n.config.NumServers {
 		if n.isPartitioned(i, n.tt.now) || n.replicas[i].Status() == stamper.ReplicaStatusRecovering {
 			numPartitioned++
 		}
@@ -323,8 +325,9 @@ func (n *network) partition() {
 	if n.canPartition(numPartitioned) && flipCoin(n.r, n.config.CutOffProb) {
 		serverId := n.r.IntN(len(n.serverAddrs))
 		dur := logNormDuration(n.r, n.config.CutOffMean, n.config.CutOffStdDev, time.Second)
-		n.serverCutOff[serverId] = n.tt.now.Add(dur)
-		// fmt.Printf("[%v] Partition n:%d duration:%v until:%v, cutoffs:%v\n", n.tt.now, serverId, dur, n.serverCutOff[serverId], n.serverCutOff)
+		n.serverCutOffFr[serverId] = n.tt.now
+		n.serverCutOffTo[serverId] = n.tt.now.Add(dur)
+		// fmt.Printf("[%v] Partition n:%d duration:%v until:%v\n", n.tt.now, serverId, dur, n.serverCutOffTo[serverId])
 		numPartitioned++
 	}
 
@@ -348,6 +351,12 @@ func (n *network) partition() {
 func (n *network) propagate(finishing bool) {
 	// schedule queued payloads with random delay & out-of-order delivery
 	for _, conn := range n.conns {
+		if n.isPartitioned(conn.srcIdx, n.tt.now.Add(-n.config.TickStep)) {
+			// simulation loop order: partition -> propagate -> advance tick
+			// so conns here are from previous tick
+			conn.Close()
+			synctest.Wait()
+		}
 		for _, data := range conn.toSchedule {
 			dur := n.config.TransportDelayMean
 			if !finishing {
