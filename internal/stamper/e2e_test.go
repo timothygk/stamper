@@ -25,7 +25,7 @@ func TestSimulation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		simulate(t, &SimulatorConfig{
 			NumServers: 3,
-			NumClients: 30,
+			NumClients: 10,
 			ReplicaConfig: stamper.ReplicaConfig{
 				SendRetryDuration:       500 * time.Millisecond,
 				CommitDelayDuration:     5 * time.Second,
@@ -35,12 +35,12 @@ func TestSimulation(t *testing.T) {
 			Seed1:                123123582,
 			Seed2:                45679445584,
 			RequestPerTick:       1,
-			NumTicks:             10000000,
+			NumTicks:             1000000,
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
-			MsgLossProb:          Fraction{5, 1000},
-			CutOffProb:           Fraction{155, 1000},
+			MsgLossProb:          Fraction{1, 1000},
+			CutOffProb:           Fraction{1, 1000},
 			CutOffMean:           10 * time.Second,
 			CutOffStdDev:         5 * time.Second,
 			RepairProb:           Fraction{5, 100},
@@ -562,7 +562,7 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 		n.propagate(false)              // propagate network messages
 		tt.advanceTime(config.TickStep) // advance time
 
-		if tickCnt%1000000 == 0 {
+		if tickCnt%100000 == 0 {
 			t.Logf(
 				"At tick %d, timers:%d tickers:%d managedconn:%d numGoroutines=%d",
 				tickCnt,

@@ -791,7 +791,7 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 		}
 		// fmt.Printf("%v node:%d quorum check on view:%d size:%d, lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, doViewChange.ViewId, len(set), best.LastLogId, bestCommitId)
 		// update state
-		r.replaceState(best.ViewId, best.LastLogId, bestCommitId, best.Logs, best.NodeId == r.config.NodeId)
+		r.replaceState(best.ViewId, best.LastLogId, bestCommitId, best.Logs, best.NodeId == r.config.NodeId, false)
 		if r.lastLogId > r.commitId {
 			r.quorumAddPrepareOk(r.lastLogId, r.config.NodeId)
 		}
@@ -826,7 +826,7 @@ func (r *Replica) handleStartView(startView *StartView) {
 	}
 
 	// update state
-	r.replaceState(startView.ViewId, startView.LastLogId, startView.CommitId, startView.Logs, false)
+	r.replaceState(startView.ViewId, startView.LastLogId, startView.CommitId, startView.Logs, false, false)
 	// send prepareOk
 	if r.lastLogId > r.commitId {
 		r.sendTo(r.primaryNode(), CmdTypePrepareOk, &PrepareOk{
@@ -901,6 +901,7 @@ func (r *Replica) handleRecoveryResponse(recoveryResponse *RecoveryResponse) {
 			primaryNodeResponse.CommitId,
 			primaryNodeResponse.Logs,
 			false,
+			true,
 		)
 		// cleanup
 		for i := range r.recoveryResponses {
@@ -985,8 +986,8 @@ func (r *Replica) handleNewState(newState *NewState) {
 	})
 }
 
-func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []RequestLog, sameNode bool) {
-	assert.Assertf(viewId > r.lastNormalViewId, "Should not replaceState to lastNormalviewId, found viewId:%d lastNormalViewId:%d", viewId, r.lastNormalViewId)
+func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []RequestLog, sameNode, recovery bool) {
+	assert.Assertf(viewId > r.lastNormalViewId || recovery, "Should not replaceState to lastNormalViewId, found viewId:%d lastNormalViewId:%d", viewId, r.lastNormalViewId)
 	r.viewId = viewId
 	r.lastNormalViewId = viewId
 	r.lastLogId = lastLogId
