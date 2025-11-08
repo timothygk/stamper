@@ -1,35 +1,29 @@
 package stamper
 
-import "github.com/timothygk/stamper/internal/assert"
+import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+
+	"github.com/timothygk/stamper/internal/assert"
+)
 
 type LogEntry struct {
 	LogId     uint64
 	ClientId  uint64
 	RequestId uint64
 	Body      []byte
-}
-
-type LogHooks interface {
-	OnInit()
-	OnAppend(*LogEntry)
+	PHash     []byte
 }
 
 type Logs struct {
 	logs  []LogEntry
-	hooks LogHooks
 }
 
-func newLogs(hooks LogHooks) *Logs {
-	sl := &Logs{hooks: hooks}
-	sl.init(1000)
+func newLogs() *Logs {
+	sl := &Logs{}
+	sl.logs = make([]LogEntry, 0, 1000)
 	return sl
-}
-
-func (sl *Logs) init(capacity int) {
-	sl.logs = make([]LogEntry, 0, capacity)
-	if sl.hooks != nil {
-		sl.hooks.OnInit()
-	}
 }
 
 func (sl *Logs) At(logId uint64) *LogEntry {
@@ -46,32 +40,55 @@ func (sl *Logs) Append(entry LogEntry) {
 		len(sl.logs),
 		entry.LogId,
 	)
-	sl.logs = append(sl.logs, entry)
-	if sl.hooks != nil {
-		sl.hooks.OnAppend(&entry)
+	// TODO: make this hashing logic backward compatible in case there's changes?
+	hasher := sha256.New()
+	if len(sl.logs) > 0 {
+		hasher.Write(sl.logs[len(sl.logs)-1].PHash)
 	}
+	fmt.Fprintf(hasher, " %d %d %d %x", entry.LogId, entry.ClientId, entry.RequestId, entry.Body)
+	entry.PHash = hasher.Sum(nil)
+	sl.logs = append(sl.logs, entry)
 }
 
 func (sl *Logs) Replace(newLogs []RequestLog) {
+	if len(newLogs) == 0 {
+		return
+	}
+
+	// assumption: newLogs is sorted
+	index := int(newLogs[0].LogId) - 1
+	// truncate index..last
+	if index < len(sl.logs) {
+		sl.logs = sl.logs[:index]
+	}
+
 	// reinit & reappend
-	sl.init(len(newLogs))
 	for i := range newLogs {
+		assert.Assertf(newLogs[i].LogId == uint64(len(sl.logs))+1, "Expected sequential, found logId:%d len:%d", newLogs[i].LogId, len(sl.logs))
 		sl.Append(LogEntry{
 			ClientId:  newLogs[i].ClientId,
 			RequestId: newLogs[i].RequestId,
 			LogId:     newLogs[i].LogId,
-			Body:      newLogs[i].Body,
+			Body:      bytes.Clone(newLogs[i].Body),
 		})
 	}
 }
 
-func (sl *Logs) CopyLogs() []RequestLog {
-	result := make([]RequestLog, len(sl.logs))
-	for i := range sl.logs {
-		result[i].ClientId = sl.logs[i].ClientId
-		result[i].RequestId = sl.logs[i].RequestId
-		result[i].LogId = sl.logs[i].LogId
-		result[i].Body = sl.logs[i].Body
+func (sl *Logs) Iterate(fromLogId uint64, toLogId uint64, handler func(entry *LogEntry)) {
+	for logId := fromLogId; logId <= toLogId; logId++ {
+		handler(sl.At(logId))
 	}
+}
+
+func (sl *Logs) CopyLogs(fromLogId, toLogId uint64) []RequestLog {
+	result := make([]RequestLog, 0, int(toLogId+1-fromLogId))
+	sl.Iterate(fromLogId, toLogId, func(entry *LogEntry) {
+		result = append(result, RequestLog{
+			ClientId:  entry.ClientId,
+			RequestId: entry.RequestId,
+			LogId:     entry.LogId,
+			Body:      entry.Body,
+		})
+	})
 	return result
 }

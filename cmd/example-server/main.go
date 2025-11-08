@@ -64,7 +64,6 @@ func main() {
 		CreateTcpConnection,
 		r,
 		func(body []byte) []byte { return append(body, []byte("_SUFFIXED")...) },
-		nil,
 		false,
 	)
 	defer func() {

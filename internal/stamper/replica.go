@@ -1,6 +1,7 @@
 package stamper
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -143,7 +144,6 @@ func NewReplica(
 	createConn func(string) (net.Conn, error),
 	r *rand.Rand,
 	upcall func([]byte) []byte,
-	logHooks LogHooks,
 	recovery bool,
 ) *Replica {
 	replica := &Replica{
@@ -160,7 +160,7 @@ func NewReplica(
 		viewId:            0,
 		status:            ReplicaStatusNormal,
 		lastLogId:         0,
-		logs:              newLogs(logHooks),
+		logs:              newLogs(),
 		commitId:          0,
 		clients:           make(map[uint64]*clientTable),
 		upcall:            upcall,
@@ -205,6 +205,13 @@ func (r *Replica) CommitId() uint64 {
 
 func (r *Replica) LastLogId() uint64 {
 	return r.lastLogId
+}
+
+func (r *Replica) LogHash(logId uint64) []byte {
+	if logId == 0 {
+		return []byte{}
+	}
+	return r.logs.At(logId).PHash
 }
 
 // Accept accept a network connection
@@ -523,6 +530,14 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 		recoveryResponse, ok := envelope.Payload.(*RecoveryResponse)
 		assert.Assert(ok, "should be able to cast envelope payload to *RecoveryResponse type")
 		r.handleRecoveryResponse(recoveryResponse)
+	case CmdTypeGetState:
+		getState, ok := envelope.Payload.(*GetState)
+		assert.Assert(ok, "should be able to cast envelope payload to *GetState type")
+		r.handleGetState(envelope.FromNodeId, getState)
+	case CmdTypeNewState:
+		newState, ok := envelope.Payload.(*NewState)
+		assert.Assert(ok, "should be able to cast envelope payload to *NewState type")
+		r.handleNewState(newState)
 	default:
 		assert.Assertf(false, "Unknown envelope cmd %d", envelope.Cmd)
 	}
@@ -599,8 +614,8 @@ func (r *Replica) handleResendPrepares() {
 		return
 	}
 
-	for logId := r.commitId + 1; logId <= r.commitId+100 && logId <= r.lastLogId; logId++ {
-		entry := r.logs.At(r.commitId + 1)
+	// TODO: fix this, currently it is hardcoded to the first 100 msgs only
+	r.logs.Iterate(r.commitId+1, min(r.commitId+100, r.lastLogId), func(entry *LogEntry) {
 		r.broadcast(CmdTypePrepare, &Prepare{
 			ViewId:   r.viewId,
 			LogId:    entry.LogId,
@@ -612,7 +627,7 @@ func (r *Replica) handleResendPrepares() {
 			},
 		})
 		r.lastCommitAt = r.tt.Now()
-	}
+	})
 }
 
 func (r *Replica) handlePrepare(prepare *Prepare) {
@@ -684,6 +699,12 @@ func (r *Replica) handleCommit(commit *Commit) {
 		return // replica in view change or recovery mode
 	}
 	if !r.validateViewId(commit.ViewId, false) {
+		if r.shouldRequestTransfer(commit.ViewId, commit.CommitId) {
+			r.broadcast(CmdTypeGetState, &GetState{
+				ViewId:    r.viewId,
+				LastLogId: r.commitId,
+			})
+		}
 		return
 	}
 
@@ -719,7 +740,7 @@ func (r *Replica) handleStartViewChange(startViewChange *StartViewChange) {
 			r.handleDoViewChange(doViewChange)
 		} else {
 			// copy logs
-			doViewChange.Logs = r.logs.CopyLogs()
+			doViewChange.Logs = r.logs.CopyLogs(1, r.lastLogId)
 			r.sendTo(nextPrimaryId, CmdTypeDoViewChange, doViewChange)
 		}
 	}
@@ -780,7 +801,7 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 		// broadcast start view
 		logs := best.Logs
 		if best.NodeId == r.config.NodeId { // late copy of the logs
-			logs = r.logs.CopyLogs()
+			logs = r.logs.CopyLogs(1, r.lastLogId)
 		}
 		r.broadcast(CmdTypeStartView, &StartView{
 			ViewId:    r.viewId,
@@ -838,7 +859,7 @@ func (r *Replica) handleRecovery(recovery *Recovery) {
 		FromNodeId: r.config.NodeId,
 	}
 	if r.primaryNode() == r.config.NodeId {
-		response.Logs = r.logs.CopyLogs()
+		response.Logs = r.logs.CopyLogs(1, r.lastLogId)
 		response.LastLogId = r.lastLogId
 		response.CommitId = r.commitId
 	}
@@ -891,6 +912,71 @@ func (r *Replica) handleRecoveryResponse(recoveryResponse *RecoveryResponse) {
 	}
 }
 
+func (r *Replica) handleGetState(fromNodeId int, getState *GetState) {
+	assert.Assert(getState != nil, "getState should not be nil")
+
+	if r.status != ReplicaStatusNormal {
+		return
+	}
+	if r.viewId < getState.ViewId {
+		return
+	}
+
+	r.sendTo(fromNodeId, CmdTypeNewState, &NewState{
+		ViewId:    r.viewId,
+		Logs:      r.logs.CopyLogs(getState.LastLogId+1, r.lastLogId),
+		LastLogId: r.lastLogId,
+		CommitId:  r.commitId,
+	})
+}
+
+func (r *Replica) handleNewState(newState *NewState) {
+	assert.Assert(newState != nil, "newState should not be nil")
+
+	if r.viewId > newState.ViewId {
+		return
+	}
+
+	// remove prefix logs
+	//  - if view id is the same, it should be equal until lastLogId
+	//  - if view id is bigger, it should be equal until commitId
+	newLogs := newState.Logs
+	for len(newLogs) > 0 && (r.viewId == newState.ViewId && newLogs[0].LogId <= r.lastLogId || newLogs[0].LogId <= r.commitId) {
+		requestLog := &newLogs[0]
+		newLogs = newLogs[1:] // pop front
+		// should be sequential
+		if len(newLogs) > 0 {
+			assert.Assert(requestLog.LogId + 1 == newLogs[0].LogId, "Should receive logs in order")
+		}
+		// should be equal, TODO: improve this check by hashing??
+		entry := r.logs.At(requestLog.LogId)
+		assert.Assert(entry.ClientId == requestLog.ClientId, "ClientId should be equal")
+		assert.Assert(entry.RequestId == requestLog.RequestId, "RequestId should be equal")
+		assert.Assert(entry.LogId == requestLog.LogId, "logId should be equal")
+		assert.Assert(bytes.Equal(entry.Body, requestLog.Body), "bytes should be equal")
+	}
+
+	r.lastLogId = newState.LastLogId
+	r.logs.Replace(newLogs)
+
+	// update view
+	r.viewId = newState.ViewId
+	if r.status == ReplicaStatusNormal {
+		r.lastNormalViewId = r.viewId
+	}
+
+	// update commit
+	r.doCommit(newState.CommitId, false)
+
+	// update client table
+	r.logs.Iterate(r.commitId+1, r.lastLogId, func(entry *LogEntry) {
+		r.clients[entry.ClientId] = &clientTable{
+			requestId: entry.RequestId,
+			reply:     nil,
+		}
+	})
+}
+
 func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []RequestLog, sameNode bool) {
 	assert.Assertf(viewId > r.lastNormalViewId, "Should not replaceState to lastNormalviewId, found viewId:%d lastNormalViewId:%d", viewId, r.lastNormalViewId)
 	r.viewId = viewId
@@ -914,16 +1000,19 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 	}
 
 	// update client table
-	for logId := r.commitId + 1; logId <= r.lastLogId; logId++ {
-		entry := r.logs.At(logId)
+	r.logs.Iterate(r.commitId+1, r.lastLogId, func(entry *LogEntry) {
 		r.clients[entry.ClientId] = &clientTable{
 			requestId: entry.RequestId,
 			reply:     nil,
 		}
-	}
+	})
 
 	// update node status
 	r.status = ReplicaStatusNormal
+}
+
+func (r *Replica) shouldRequestTransfer(viewId, logId uint64) bool {
+	return r.viewId < viewId || r.viewId == viewId && r.lastLogId < logId
 }
 
 func (r *Replica) validateViewId(viewId uint64, shouldBePrimary bool) bool {
@@ -940,7 +1029,7 @@ func (r *Replica) appendLog(request *Request) {
 		LogId:     r.lastLogId,
 		ClientId:  request.ClientId,
 		RequestId: request.RequestId,
-		Body:      request.RequestBody,
+		Body:      bytes.Clone(request.RequestBody), // copy
 	})
 	r.clients[request.ClientId] = &clientTable{
 		requestId: request.RequestId,
@@ -964,11 +1053,10 @@ func (r *Replica) doCommit(toCommitId uint64, sendReply bool) {
 	if r.lastLogId < toCommitId {
 		toCommitId = r.lastLogId
 	}
-	for logId := r.commitId + 1; logId <= toCommitId; logId++ {
+	r.logs.Iterate(r.commitId+1, toCommitId, func(entry *LogEntry) {
 		// upcall & commit
-		entry := r.logs.At(logId)
 		responseBody := r.upcall(entry.Body)
-		r.commitId = logId
+		r.commitId = entry.LogId
 		// update client table
 		reply := &Reply{
 			ViewId:       r.viewId,
@@ -982,7 +1070,7 @@ func (r *Replica) doCommit(toCommitId uint64, sendReply bool) {
 		if sendReply {
 			r.sendReply(entry.ClientId, reply)
 		}
-	}
+	})
 }
 
 func (r *Replica) quorumAddStartViewChange(viewId uint64, nodeId int) uint64 {

@@ -61,6 +61,10 @@ func (JsonEncoderDecoder) Decode(r io.Reader) (*Envelope, error) {
 		envelope.Payload = &Recovery{}
 	case CmdTypeRecoveryResponse:
 		envelope.Payload = &RecoveryResponse{}
+	case CmdTypeGetState:
+		envelope.Payload = &GetState{}
+	case CmdTypeNewState:
+		envelope.Payload = &NewState{}
 	default:
 		return nil, ErrUnknownCmdType
 	}

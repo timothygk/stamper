@@ -51,6 +51,8 @@ const (
 	CmdTypeStartView        CmdType = 8
 	CmdTypeRecovery         CmdType = 9
 	CmdTypeRecoveryResponse CmdType = 10
+	CmdTypeGetState         CmdType = 11
+	CmdTypeNewState         CmdType = 12
 )
 
 func (c CmdType) String() string {
@@ -75,6 +77,10 @@ func (c CmdType) String() string {
 		return "Recovery"
 	case CmdTypeRecoveryResponse:
 		return "RecoveryResponse"
+	case CmdTypeGetState:
+		return "GetState"
+	case CmdTypeNewState:
+		return "NewState"
 	default:
 		return "UNKNOWN"
 	}
@@ -151,6 +157,18 @@ type RecoveryResponse struct {
 	LastLogId  uint64       // op-number, empty if it is not from the primary node
 	CommitId   uint64       // commit-number, empty if it is not from the primary node
 	FromNodeId int          // source node-id
+}
+
+type GetState struct {
+	ViewId    uint64 // view-number
+	LastLogId uint64 // op-number of the requester
+}
+
+type NewState struct {
+	ViewId    uint64       // view-number
+	Logs      []RequestLog // the new logs
+	LastLogId uint64       // op-number
+	CommitId  uint64       // commit-number
 }
 
 // Envelope the envelope structure used for communications

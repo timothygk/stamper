@@ -2,10 +2,8 @@ package stamper_test
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"hash"
 	"io"
 	"math"
 	"math/rand/v2"
@@ -75,22 +73,6 @@ func initClient(serverAddrs []string, clientId uint64, tt timepkg.Time, createCo
 		stamper.JsonEncoderDecoder{},
 		createConn,
 	)
-}
-
-type logHooks struct {
-	nodeId        int
-	prefixLogHash [][]byte
-	prefixHash    hash.Hash
-}
-
-func (h *logHooks) OnInit() {
-	h.prefixHash = sha256.New()
-	h.prefixLogHash = [][]byte{h.prefixHash.Sum(nil)}
-}
-
-func (h *logHooks) OnAppend(entry *stamper.LogEntry) {
-	h.prefixHash.Write(entry.Body)
-	h.prefixLogHash = append(h.prefixLogHash, h.prefixHash.Sum(nil))
 }
 
 type mockedTimer struct {
@@ -292,7 +274,6 @@ type network struct {
 	tt              *mockedTime
 	serverAddrs     []string
 	replicas        []*stamper.Replica
-	replicaLogHooks []*logHooks
 	clientAddrs     []string
 	clients         []*client.Client
 	conns           []*conn
@@ -307,10 +288,6 @@ func newNetwork(config *SimulatorConfig, r *rand.Rand, tt *mockedTime) *network 
 		serverAddrs:  iotaWithPrefix("server", config.NumServers, 0),
 		clientAddrs:  iotaWithPrefix("client", config.NumClients, 0),
 		serverCutOff: make([]time.Time, config.NumServers),
-	}
-	n.replicaLogHooks = make([]*logHooks, len(n.serverAddrs))
-	for i := range n.replicaLogHooks {
-		n.replicaLogHooks[i] = &logHooks{nodeId: i}
 	}
 	n.replicas = make([]*stamper.Replica, len(n.serverAddrs))
 	for i := range n.replicas {
@@ -343,6 +320,7 @@ func (n *network) partition() {
 		serverId := n.r.IntN(len(n.serverAddrs))
 		dur := logNormDuration(n.r, n.config.CutOffMean, n.config.CutOffStdDev, time.Second)
 		n.serverCutOff[serverId] = n.tt.now.Add(dur)
+		// fmt.Printf("[%v] Partition n:%d duration:%v until:%v\n", n.tt.now, serverId, dur, n.serverCutOff[serverId])
 		numPartitioned++
 	}
 
@@ -422,12 +400,12 @@ func (n *network) propagate(finishing bool) {
 				numLogPresent++
 				if i != j {
 					// validate that all logs are the same <= r1.CommitId()
-					commitId := r1.CommitId()
-					h1 := n.replicaLogHooks[i].prefixLogHash[commitId]
-					h2 := n.replicaLogHooks[j].prefixLogHash[commitId]
 					if r2.Status() == stamper.ReplicaStatusNormal && r1.ViewId() == r2.ViewId() {
+						commitId := r1.CommitId()
+						h1 := r1.LogHash(commitId)
+						h2 := r2.LogHash(commitId)
 						assert.Assertf(
-							 bytes.Equal(h1, h2),
+							bytes.Equal(h1, h2),
 							"Unequal prefix to commitId:%d of node n:%d,s:%d,v:%d,c:%d,l:%d and n:%d,s:%d,v:%d,c:%d,l:%d, expected:%x got: %x",
 							r1.CommitId(),
 							i, r1.Status(), r1.ViewId(), r1.CommitId(), r1.LastLogId(),
@@ -460,8 +438,8 @@ func (n *network) propagate(finishing bool) {
 			}
 			// validate that intersecting committed logs are the same
 			minCommitId := min(r1.CommitId(), r2.CommitId())
-			h1 := n.replicaLogHooks[i].prefixLogHash[minCommitId]
-			h2 := n.replicaLogHooks[j].prefixLogHash[minCommitId]
+			h1 := r1.LogHash(minCommitId)
+			h2 := r2.LogHash(minCommitId)
 			assert.Assertf(bytes.Equal(h1, h2), "Unequal prefix to logId:%d of node %d and %d, expected:%x got: %x", minCommitId, i, j, h1, h2)
 		}
 	}
@@ -520,7 +498,6 @@ func (n *network) createReplica(i int, repair bool) *stamper.Replica {
 		n.createConnFunc(n.serverAddrs[i]),
 		rand.New(rand.NewPCG(n.r.Uint64(), n.r.Uint64())),
 		func(body []byte) []byte { return append(body, []byte("_SUFFIXED")...) },
-		n.replicaLogHooks[i],
 		repair,
 	)
 }
@@ -531,7 +508,7 @@ func (n *network) getReplicaState(i int) string {
 		n.replicas[i].ViewId(),
 		n.replicas[i].CommitId(),
 		n.replicas[i].LastLogId(),
-		n.replicaLogHooks[i].prefixHash.Sum(nil),
+		n.replicas[i].LogHash(n.replicas[i].LastLogId()),
 	)
 }
 
