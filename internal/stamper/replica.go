@@ -636,7 +636,8 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 	if r.status != ReplicaStatusNormal {
 		return // replica in view change or recovery mode
 	}
-	if !r.validateViewId(prepare.ViewId, prepare.LogId, false) {
+	if !r.validateViewId(prepare.ViewId, false) {
+		r.initGetState(prepare.ViewId, prepare.LogId, 1, true)
 		return
 	}
 	if r.lastLogId >= prepare.LogId {
@@ -681,7 +682,8 @@ func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) {
 	if r.status != ReplicaStatusNormal {
 		return // replica in view change or recovery mode
 	}
-	if !r.validateViewId(prepareOk.ViewId, prepareOk.LogId, true) {
+	if !r.validateViewId(prepareOk.ViewId, true) {
+		r.initGetState(prepareOk.ViewId, prepareOk.LogId, 0, false)
 		return
 	}
 	if r.commitId >= prepareOk.LogId {
@@ -698,7 +700,8 @@ func (r *Replica) handleCommit(commit *Commit) {
 	if r.status != ReplicaStatusNormal {
 		return // replica in view change or recovery mode
 	}
-	if !r.validateViewId(commit.ViewId, commit.CommitId, false) {
+	if !r.validateViewId(commit.ViewId, false) {
+		r.initGetState(commit.ViewId, commit.CommitId, 0, true)
 		return
 	}
 
@@ -940,7 +943,7 @@ func (r *Replica) handleNewState(newState *NewState) {
 		newLogs = newLogs[1:] // pop front
 		// should be sequential
 		if len(newLogs) > 0 {
-			assert.Assert(requestLog.LogId + 1 == newLogs[0].LogId, "Should receive logs in order")
+			assert.Assert(requestLog.LogId+1 == newLogs[0].LogId, "Should receive logs in order")
 		}
 		// should be equal, TODO: improve this check by hashing??
 		entry := r.logs.At(requestLog.LogId)
@@ -1006,17 +1009,17 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 	r.status = ReplicaStatusNormal
 }
 
-func (r *Replica) validateViewId(viewId, logId uint64, shouldBePrimary bool) bool {
-	if viewId == r.viewId && shouldBePrimary == (r.primaryNode() == r.config.NodeId) {
-		return true
-	}
-	if r.viewId < viewId || r.viewId == viewId && r.lastLogId + 1 < logId {
+func (r *Replica) validateViewId(viewId uint64, shouldBePrimary bool) bool {
+	return viewId == r.viewId && shouldBePrimary == (r.primaryNode() == r.config.NodeId)
+}
+
+func (r *Replica) initGetState(viewId, logId, gap uint64, checkEqView bool) {
+	if r.viewId < viewId || !checkEqView || checkEqView && r.viewId == viewId && r.lastLogId+gap < logId {
 		r.broadcast(CmdTypeGetState, &GetState{
 			ViewId:    r.viewId,
 			LastLogId: r.commitId,
 		})
 	}
-	return false
 }
 
 func (r *Replica) primaryNode() int {
