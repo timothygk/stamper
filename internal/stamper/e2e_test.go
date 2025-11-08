@@ -34,16 +34,16 @@ func TestSimulation(t *testing.T) {
 			},
 			Seed1:                123123582,
 			Seed2:                45679445584,
-			RequestPerTick:       2,
+			RequestPerTick:       3,
 			NumTicks:             1000000,
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
-			MsgLossProb:          Fraction{5, 1000},
-			CutOffProb:           Fraction{10, 1000},
+			MsgLossProb:          Fraction{1, 1000},
+			CutOffProb:           Fraction{1, 1000},
 			CutOffMean:           10 * time.Second,
 			CutOffStdDev:         5 * time.Second,
-			RepairProb:           Fraction{0, 100},
+			RepairProb:           Fraction{5, 100},
 		})
 	})
 }

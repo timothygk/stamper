@@ -958,6 +958,7 @@ func (r *Replica) handleNewState(newState *NewState) {
 
 	r.lastLogId = newState.LastLogId
 	r.logs.Replace(newLogs)
+	r.logs.TruncateFrom(r.lastLogId + 1) // in case old primary have seen a new view
 
 	// update view
 	r.viewId = newState.ViewId

@@ -17,7 +17,7 @@ type LogEntry struct {
 }
 
 type Logs struct {
-	logs  []LogEntry
+	logs []LogEntry
 }
 
 func newLogs() *Logs {
@@ -55,12 +55,8 @@ func (sl *Logs) Replace(newLogs []RequestLog) {
 		return
 	}
 
-	// assumption: newLogs is sorted
-	index := int(newLogs[0].LogId) - 1
-	// truncate index..last
-	if index < len(sl.logs) {
-		sl.logs = sl.logs[:index]
-	}
+	// assumption: newLogs is ordered by its log id
+	sl.TruncateFrom(newLogs[0].LogId)
 
 	// reinit & reappend
 	for i := range newLogs {
@@ -71,6 +67,15 @@ func (sl *Logs) Replace(newLogs []RequestLog) {
 			LogId:     newLogs[i].LogId,
 			Body:      bytes.Clone(newLogs[i].Body),
 		})
+	}
+}
+
+func (sl *Logs) TruncateFrom(logId uint64) {
+	// logs >= logId will be removed
+	index := int(logId) - 1
+	// truncate index..last
+	if index < len(sl.logs) {
+		sl.logs = sl.logs[:index]
 	}
 }
 
