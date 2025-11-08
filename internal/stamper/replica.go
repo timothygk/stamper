@@ -636,7 +636,7 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 	if r.status != ReplicaStatusNormal {
 		return // replica in view change or recovery mode
 	}
-	if !r.validateViewId(prepare.ViewId, false) {
+	if !r.validateViewId(prepare.ViewId, prepare.LogId, false) {
 		return
 	}
 	if r.lastLogId >= prepare.LogId {
@@ -681,7 +681,7 @@ func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) {
 	if r.status != ReplicaStatusNormal {
 		return // replica in view change or recovery mode
 	}
-	if !r.validateViewId(prepareOk.ViewId, true) {
+	if !r.validateViewId(prepareOk.ViewId, prepareOk.LogId, true) {
 		return
 	}
 	if r.commitId >= prepareOk.LogId {
@@ -698,13 +698,7 @@ func (r *Replica) handleCommit(commit *Commit) {
 	if r.status != ReplicaStatusNormal {
 		return // replica in view change or recovery mode
 	}
-	if !r.validateViewId(commit.ViewId, false) {
-		if r.shouldRequestTransfer(commit.ViewId, commit.CommitId) {
-			r.broadcast(CmdTypeGetState, &GetState{
-				ViewId:    r.viewId,
-				LastLogId: r.commitId,
-			})
-		}
+	if !r.validateViewId(commit.ViewId, commit.CommitId, false) {
 		return
 	}
 
@@ -1012,12 +1006,17 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 	r.status = ReplicaStatusNormal
 }
 
-func (r *Replica) shouldRequestTransfer(viewId, logId uint64) bool {
-	return r.viewId < viewId || r.viewId == viewId && r.lastLogId < logId
-}
-
-func (r *Replica) validateViewId(viewId uint64, shouldBePrimary bool) bool {
-	return viewId == r.viewId && shouldBePrimary == (r.primaryNode() == r.config.NodeId)
+func (r *Replica) validateViewId(viewId, logId uint64, shouldBePrimary bool) bool {
+	if viewId == r.viewId && shouldBePrimary == (r.primaryNode() == r.config.NodeId) {
+		return true
+	}
+	if r.viewId < viewId || r.viewId == viewId && r.lastLogId + 1 < logId {
+		r.broadcast(CmdTypeGetState, &GetState{
+			ViewId:    r.viewId,
+			LastLogId: r.commitId,
+		})
+	}
+	return false
 }
 
 func (r *Replica) primaryNode() int {

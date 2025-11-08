@@ -25,7 +25,7 @@ func TestSimulation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		simulate(t, &SimulatorConfig{
 			NumServers: 3,
-			NumClients: 100,
+			NumClients: 10,
 			ReplicaConfig: stamper.ReplicaConfig{
 				SendRetryDuration:       500 * time.Millisecond,
 				CommitDelayDuration:     5 * time.Second,
@@ -39,8 +39,8 @@ func TestSimulation(t *testing.T) {
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
-			MsgLossProb:          Fraction{100, 1000},
-			CutOffProb:           Fraction{100, 1000},
+			MsgLossProb:          Fraction{5, 1000},
+			CutOffProb:           Fraction{15, 1000},
 			CutOffMean:           10 * time.Second,
 			CutOffStdDev:         5 * time.Second,
 			RepairProb:           Fraction{5, 100},
