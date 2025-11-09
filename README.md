@@ -9,6 +9,11 @@ To run simulation test
 $ GOMAXPROCS=1 go test ./internal/stamper/ -v -count=1 -run TestSimulation
 ```
 
+random simulation testing
+```console
+$ GOMAXPROCS=1 go test ./internal/stamper/ -v -count=1 -run TestRandomSimulation
+```
+
 ### Checklists
 
 VSR
@@ -22,17 +27,21 @@ VSR
 - [ ] reconfiguration
 
 Simulation testing
-- [x] mock time
-- [x] mock network
-- [x] random recovery
+- [ ] simulation
+  - [x] mock time
+  - [x] mock network
+  - [x] out-of-order delivery
+  - [x] network slowness
+  - [ ] non-uniform configuration
+  - [ ] simulator config random generator
+  - [ ] CI to run simulation with random configurations
 - [ ] fault injection
   - [x] message loss
   - [x] simple network partition
   - [ ] more complex network partition
+  - [x] random recovery
 - [ ] invariants
   - [x] reply correctness check
   - [x] eventually ended in the same state check
   - [x] message loss check
   - [x] split brain check
-- [ ] simulation config fuzzer
-- [ ] CI to run simulation with random configurations

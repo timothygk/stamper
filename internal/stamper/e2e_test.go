@@ -3,6 +3,7 @@ package stamper_test
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -21,6 +22,46 @@ import (
 	"github.com/timothygk/stamper/internal/timepkg"
 )
 
+func TestRandomSimulation(t *testing.T) {
+	// generate configs to be tested
+	configs := make([]SimulatorConfig, 10)
+	r := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
+	for i := range configs {
+		configs[i] = SimulatorConfig{
+			NumServers: r.IntN(2) * 2 + 3,
+			NumClients: r.IntN(10) + 5,
+			ReplicaConfig: stamper.ReplicaConfig{
+				SendRetryDuration:       500 * time.Millisecond,
+				CommitDelayDuration:     3 * time.Second,
+				ViewChangeDelayDuration: 6 * time.Second,
+				RecoveryRetryDuration:   6 * time.Second,
+			},
+			Seed1:                r.Uint64(),
+			Seed2:                r.Uint64(),
+			RequestPerTick:       1 + r.IntN(5),
+			NumTicks:             1000000,
+			TickStep:             500 * time.Microsecond,
+			TransportDelayMean:   500 * time.Microsecond,
+			TransportDelayStdDev: 500 * time.Microsecond,
+			MsgLossProb:          Fraction{r.Uint64N(300), 1000},
+			CutOffProb:           Fraction{r.Uint64N(300), 1000},
+			CutOffMean:           10 * time.Second,
+			CutOffStdDev:         5 * time.Second,
+			RepairProb:           Fraction{r.Uint64N(30), 100},
+		}
+	}
+
+	for i := range configs {
+		configJson, _ := json.Marshal(configs[i])
+
+		t.Run(fmt.Sprintf("config:%s", string(configJson)), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				simulate(t, &configs[i])
+			})
+		})
+	}
+}
+
 func TestSimulation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		simulate(t, &SimulatorConfig{
@@ -32,10 +73,10 @@ func TestSimulation(t *testing.T) {
 				ViewChangeDelayDuration: 10 * time.Second,
 				RecoveryRetryDuration:   10 * time.Second,
 			},
-			Seed1:                123123582,
-			Seed2:                45679445584,
+			Seed1:                123,
+			Seed2:                123,
 			RequestPerTick:       1,
-			NumTicks:             1000000,
+			NumTicks:             1000,
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
