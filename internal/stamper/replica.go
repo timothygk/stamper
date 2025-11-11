@@ -975,13 +975,10 @@ func (r *Replica) handleNewState(newState *NewState) {
 	// update commit
 	r.doCommit(newState.CommitId, false)
 
-	// update client table
-	r.logs.Iterate(r.commitId+1, r.lastLogId, func(entry *LogEntry) {
-		r.clients[entry.ClientId] = &clientTable{
-			requestId: entry.RequestId,
-			reply:     nil,
-		}
-	})
+	// update internal states
+	r.clearInvalidWaitingPrepares()
+	r.clearInvalidDoViewChangeSet()
+	r.updateClientTableByLogs(r.commitId + 1)
 
 	// handle next prepare logId if present
 	if nextPrepare, ok := r.waitingPrepares[r.lastLogId+1]; ok {
@@ -1003,21 +1000,10 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 	// commit
 	r.doCommit(commitId, false)
 
-	// clear internal states
-	clear(r.waitingPrepares)
-	for viewId := range r.doViewChangeSet {
-		if viewId <= r.viewId {
-			delete(r.doViewChangeSet, viewId)
-		}
-	}
-
-	// update client table
-	r.logs.Iterate(r.commitId+1, r.lastLogId, func(entry *LogEntry) {
-		r.clients[entry.ClientId] = &clientTable{
-			requestId: entry.RequestId,
-			reply:     nil,
-		}
-	})
+	// update internal states
+	r.clearInvalidWaitingPrepares()
+	r.clearInvalidDoViewChangeSet()
+	r.updateClientTableByLogs(r.commitId + 1)
 
 	// update node status
 	r.status = ReplicaStatusNormal
@@ -1038,13 +1024,6 @@ func (r *Replica) initGetState(viewId, logId, gap uint64, checkEqView bool) {
 
 func (r *Replica) primaryNode() int {
 	return int(r.viewId) % len(r.config.ServerAddrs)
-}
-
-func (r *Replica) storeWaitingPrepare(prepare *Prepare) {
-	// only update mapping if it has more advanced view
-	if waitingPrepare, ok := r.waitingPrepares[prepare.LogId]; !ok || waitingPrepare.ViewId < prepare.ViewId {
-		r.waitingPrepares[prepare.LogId] = prepare
-	}
 }
 
 func (r *Replica) appendLog(request *Request) {
@@ -1109,4 +1088,40 @@ func (r *Replica) quorumAddStartViewChange(viewId uint64, nodeId int) uint64 {
 
 	threshold := (len(r.config.ServerAddrs))/2 + 1
 	return viewIds[threshold-1]
+}
+
+func (r *Replica) storeWaitingPrepare(prepare *Prepare) {
+	// only update mapping if it has more advanced view
+	if waitingPrepare, ok := r.waitingPrepares[prepare.LogId]; !ok || waitingPrepare.ViewId < prepare.ViewId {
+		r.waitingPrepares[prepare.LogId] = prepare
+	}
+}
+
+func (r *Replica) clearInvalidWaitingPrepares() {
+	toRemove := []uint64{}
+	for logId, prepare := range r.waitingPrepares {
+		if logId <= r.lastLogId || prepare.ViewId < r.viewId {
+			toRemove = append(toRemove, logId)
+		}
+	}
+	for _, logId := range toRemove {
+		delete(r.waitingPrepares, logId)
+	}
+}
+
+func (r *Replica) clearInvalidDoViewChangeSet() {
+	for viewId := range r.doViewChangeSet {
+		if viewId <= r.viewId {
+			delete(r.doViewChangeSet, viewId)
+		}
+	}
+}
+
+func (r *Replica) updateClientTableByLogs(fromLogId uint64) {
+	r.logs.Iterate(fromLogId, r.lastLogId, func(entry *LogEntry) {
+		r.clients[entry.ClientId] = &clientTable{
+			requestId: entry.RequestId,
+			reply:     nil,
+		}
+	})
 }
