@@ -76,7 +76,7 @@ func TestSimulation(t *testing.T) {
 			Seed1:                123,
 			Seed2:                123,
 			RequestPerTick:       1,
-			NumTicks:             1000,
+			NumTicks:             1000000,
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,

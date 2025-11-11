@@ -31,7 +31,8 @@ Simulation testing
   - [x] mock time
   - [x] mock network
   - [x] out-of-order delivery
-  - [x] network slowness
+  - [x] simple network delay
+  - [ ] more complex network delay
   - [ ] non-uniform configuration
   - [ ] simulator config random generator
   - [ ] CI to run simulation with random configurations

@@ -637,6 +637,7 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 		return // replica in view change or recovery mode
 	}
 	if !r.validateViewId(prepare.ViewId, false) {
+		r.storeWaitingPrepare(prepare)
 		r.initGetState(prepare.ViewId, prepare.LogId, 1, true)
 		return
 	}
@@ -652,20 +653,12 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 	r.doCommit(prepare.CommitId, false)
 
 	if r.lastLogId+1 < prepare.LogId {
-		r.waitingPrepares[prepare.LogId] = prepare
+		r.storeWaitingPrepare(prepare)
 		return
 	}
 
 	// advance log and add to client table
 	r.appendLog(prepare.ClientRequest)
-
-	nextPrepare, ok := r.waitingPrepares[r.lastLogId+1]
-	for ok {
-		// advance log and add to client table
-		r.appendLog(nextPrepare.ClientRequest)
-		delete(r.waitingPrepares, nextPrepare.LogId)
-		nextPrepare, ok = r.waitingPrepares[r.lastLogId+1]
-	}
 
 	// send PrepareOk to primary node
 	primaryNodeId := r.primaryNode()
@@ -674,6 +667,11 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 		LogId:  r.lastLogId,
 		NodeId: r.config.NodeId,
 	})
+
+	// handle next prepare if present
+	if nextPrepare, ok := r.waitingPrepares[r.lastLogId+1]; ok {
+		r.handlePrepare(nextPrepare)
+	}
 }
 
 func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) {
@@ -984,6 +982,11 @@ func (r *Replica) handleNewState(newState *NewState) {
 			reply:     nil,
 		}
 	})
+
+	// handle next prepare logId if present
+	if nextPrepare, ok := r.waitingPrepares[r.lastLogId+1]; ok {
+		r.handlePrepare(nextPrepare)
+	}
 }
 
 func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []RequestLog, sameNode, recovery bool) {
@@ -1037,6 +1040,13 @@ func (r *Replica) primaryNode() int {
 	return int(r.viewId) % len(r.config.ServerAddrs)
 }
 
+func (r *Replica) storeWaitingPrepare(prepare *Prepare) {
+	// only update mapping if it has more advanced view
+	if waitingPrepare, ok := r.waitingPrepares[prepare.LogId]; !ok || waitingPrepare.ViewId < prepare.ViewId {
+		r.waitingPrepares[prepare.LogId] = prepare
+	}
+}
+
 func (r *Replica) appendLog(request *Request) {
 	r.lastLogId++
 	r.logs.Append(LogEntry{
@@ -1049,6 +1059,7 @@ func (r *Replica) appendLog(request *Request) {
 		requestId: request.RequestId,
 		reply:     nil,
 	}
+	delete(r.waitingPrepares, r.lastLogId)
 }
 
 func (r *Replica) quorumAddPrepareOk(logId uint64, nodeId int) uint64 {
