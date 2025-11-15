@@ -3,6 +3,7 @@ package stamper
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"net"
 	"sort"
@@ -127,10 +128,10 @@ type Replica struct {
 	lastPreparedLogId []uint64            // node -> last prepared log id
 	lastCommitAt      time.Time           // last commit time
 	// view-change related
-	lastNormalViewId  uint64
-	lastChangedViewId []uint64 // last view change id
-	viewChangeTimer   timepkg.Timer
-	doViewChangeSet   map[uint64]map[int]*DoViewChange // viewId -> {nodeId -> doViewChange}
+	lastNormalViewId   uint64
+	startViewChangeSet map[uint64]map[int]*StartViewChange
+	viewChangeTimer    timepkg.Timer
+	doViewChangeSet    map[uint64]map[int]*DoViewChange // viewId -> {nodeId -> doViewChange}
 	// recovery related
 	recoveryNonce     uint64
 	recoveryResponses []*RecoveryResponse
@@ -152,25 +153,25 @@ func NewReplica(
 		encdec:     encdec,
 		createConn: createConn,
 		// TODO: better connection management?
-		conns:             make([]net.Conn, 0, 10),
-		serverConns:       make([]net.Conn, len(config.ServerAddrs)),
-		clientConns:       make(map[uint64]net.Conn),
-		r:                 r,
-		events:            make(chan event, 1000),
-		viewId:            0,
-		status:            ReplicaStatusNormal,
-		lastLogId:         0,
-		logs:              newLogs(),
-		commitId:          0,
-		clients:           make(map[uint64]*clientTable),
-		upcall:            upcall,
-		closing:           make(chan struct{}),
-		closed:            make(chan struct{}),
-		waitingPrepares:   make(map[uint64]*Prepare),
-		lastPreparedLogId: make([]uint64, len(config.ServerAddrs)),
-		lastNormalViewId:  0,
-		lastChangedViewId: make([]uint64, len(config.ServerAddrs)),
-		doViewChangeSet:   make(map[uint64]map[int]*DoViewChange),
+		conns:              make([]net.Conn, 0, 10),
+		serverConns:        make([]net.Conn, len(config.ServerAddrs)),
+		clientConns:        make(map[uint64]net.Conn),
+		r:                  r,
+		events:             make(chan event, 1000),
+		viewId:             0,
+		status:             ReplicaStatusNormal,
+		lastLogId:          0,
+		logs:               newLogs(),
+		commitId:           0,
+		clients:            make(map[uint64]*clientTable),
+		upcall:             upcall,
+		closing:            make(chan struct{}),
+		closed:             make(chan struct{}),
+		waitingPrepares:    make(map[uint64]*Prepare),
+		lastPreparedLogId:  make([]uint64, len(config.ServerAddrs)),
+		lastNormalViewId:   0,
+		startViewChangeSet: make(map[uint64]map[int]*StartViewChange),
+		doViewChangeSet:    make(map[uint64]map[int]*DoViewChange),
 	}
 	if recovery {
 		replica.status = ReplicaStatusRecovering
@@ -216,7 +217,6 @@ func (r *Replica) LogHash(logId uint64) []byte {
 
 // Accept accept a network connection
 func (r *Replica) Accept(conn net.Conn) {
-	// fmt.Printf("Accepted connection %p from %s\n", conn, conn.RemoteAddr().String())
 	r.events <- event{
 		etype: eventTypeConnAccepted,
 		conn:  conn,
@@ -450,8 +450,8 @@ func (r *Replica) handleViewChangeTimer() {
 		return
 	}
 	r.initViewChange(r.viewId + 1)
-	toViewId := r.quorumAddStartViewChange(r.viewId, r.config.NodeId)
-	assert.Assert(toViewId < r.viewId, "First view change timer should not have F replies from other replicas")
+	svc := r.quorumAddStartViewChange(r.config.NodeId, r.viewId, nil)
+	assert.Assert(svc == nil, "First view change timer should not have F replies from other replicas")
 }
 
 func (r *Replica) handleInitRecovery() {
@@ -474,13 +474,15 @@ func (r *Replica) handleInitRecovery() {
 }
 
 func (r *Replica) initViewChange(viewId uint64) {
-	// fmt.Printf("%v node:%d initViewChange fromViewId:%d toViewId:%d lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, r.viewId, viewId, r.lastLogId, r.commitId)
 	r.status = ReplicaStatusViewChange
 	r.viewId = viewId
-	r.broadcast(CmdTypeStartViewChange, &StartViewChange{
-		ViewId: r.viewId,
-		NodeId: r.config.NodeId,
-	})
+	svc := &StartViewChange{
+		ViewId:   r.viewId,
+		NodeId:   r.config.NodeId,
+		CommitId: r.commitId,
+	}
+	r.broadcast(CmdTypeStartViewChange, svc)
+	r.quorumAddStartViewChange(r.config.NodeId, r.viewId, svc)
 }
 
 func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
@@ -505,22 +507,18 @@ func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
 	case CmdTypeCommit:
 		commit, ok := envelope.Payload.(*Commit)
 		assert.Assert(ok, "should be able to cast envelope payload to *Commit type")
-		// fmt.Printf("%v node:%d Commit by_node:%d viewId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, envelope.FromNodeId, commit.ViewId, commit.CommitId)
 		r.handleCommit(commit)
 	case CmdTypeStartViewChange:
 		startViewChange, ok := envelope.Payload.(*StartViewChange)
 		assert.Assert(ok, "should be able to cast envelope payload to *StartViewChange type")
-		// fmt.Printf("%v node:%d StartViewChange by_node:%d viewId:%d\n", r.tt.Now(), r.config.NodeId, startViewChange.NodeId, startViewChange.ViewId)
 		r.handleStartViewChange(startViewChange)
 	case CmdTypeDoViewChange:
 		doViewChange, ok := envelope.Payload.(*DoViewChange)
 		assert.Assert(ok, "should be able to cast envelope payload to *DoViewChange type")
-		// fmt.Printf("%v node:%d DoViewChange by_node:%d viewId:%d lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, doViewChange.NodeId, doViewChange.ViewId, doViewChange.LastLogId, doViewChange.CommitId)
 		r.handleDoViewChange(doViewChange)
 	case CmdTypeStartView:
 		startView, ok := envelope.Payload.(*StartView)
 		assert.Assert(ok, "should be able to cast envelope payload to *StartView type")
-		// fmt.Printf("%v node:%d StartView viewId:%d lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, startView.ViewId, startView.LastLogId, startView.CommitId)
 		r.handleStartView(startView)
 	case CmdTypeRecovery:
 		recovery, ok := envelope.Payload.(*Recovery)
@@ -638,7 +636,7 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 	}
 	if !r.validateViewId(prepare.ViewId, false) {
 		r.storeWaitingPrepare(prepare)
-		r.initGetState(prepare.ViewId, prepare.LogId, 1, true)
+		r.initGetState(prepare.ViewId, prepare.LogId, 1, false)
 		return
 	}
 	if r.lastLogId >= prepare.LogId {
@@ -654,6 +652,7 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 
 	if r.lastLogId+1 < prepare.LogId {
 		r.storeWaitingPrepare(prepare)
+		r.initGetState(prepare.ViewId, prepare.LogId, 1, true)
 		return
 	}
 
@@ -690,6 +689,9 @@ func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) {
 
 	toCommitId := r.quorumAddPrepareOk(prepareOk.LogId, prepareOk.NodeId)
 	r.doCommit(toCommitId, true)
+	if toCommitId < r.lastLogId {
+		r.initGetState(prepareOk.ViewId, prepareOk.LogId, 0, true)
+	}
 }
 
 func (r *Replica) handleCommit(commit *Commit) {
@@ -699,13 +701,16 @@ func (r *Replica) handleCommit(commit *Commit) {
 		return // replica in view change or recovery mode
 	}
 	if !r.validateViewId(commit.ViewId, false) {
-		r.initGetState(commit.ViewId, commit.CommitId, 0, true)
+		r.initGetState(commit.ViewId, commit.CommitId, 0, false)
 		return
 	}
 
 	// reset view change timer since there's a message from primary node
 	r.viewChangeTimer.Reset(r.config.ViewChangeDelayDuration)
 	r.doCommit(commit.CommitId, false)
+	if commit.CommitId < r.lastLogId {
+		r.initGetState(commit.ViewId, commit.CommitId, 0, true)
+	}
 }
 
 func (r *Replica) handleStartViewChange(startViewChange *StartViewChange) {
@@ -718,14 +723,13 @@ func (r *Replica) handleStartViewChange(startViewChange *StartViewChange) {
 	if startViewChange.ViewId > r.viewId {
 		// trigger view change
 		r.initViewChange(startViewChange.ViewId)
-		r.quorumAddStartViewChange(startViewChange.ViewId, r.config.NodeId)
 	}
 
-	toViewId := r.quorumAddStartViewChange(startViewChange.ViewId, startViewChange.NodeId)
-	if toViewId > r.lastNormalViewId {
-		nextPrimaryId := int(toViewId % uint64(len(r.config.ServerAddrs)))
+	svc := r.quorumAddStartViewChange(startViewChange.NodeId, startViewChange.ViewId, startViewChange)
+	if svc != nil {
+		nextPrimaryId := int(svc.ViewId % uint64(len(r.config.ServerAddrs)))
 		doViewChange := &DoViewChange{
-			ViewId:           toViewId,
+			ViewId:           svc.ViewId,
 			LastNormalViewId: r.lastNormalViewId,
 			LastLogId:        r.lastLogId,
 			CommitId:         r.commitId,
@@ -735,7 +739,7 @@ func (r *Replica) handleStartViewChange(startViewChange *StartViewChange) {
 			r.handleDoViewChange(doViewChange)
 		} else {
 			// copy logs
-			doViewChange.Logs = r.logs.CopyLogs(1, r.lastLogId)
+			doViewChange.Logs = r.logs.CopyLogs(svc.CommitId+1, r.lastLogId)
 			r.sendTo(nextPrimaryId, CmdTypeDoViewChange, doViewChange)
 		}
 	}
@@ -762,7 +766,6 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 	if doViewChange.ViewId > r.viewId {
 		// transition state to view change mode
 		r.initViewChange(doViewChange.ViewId)
-		r.quorumAddStartViewChange(doViewChange.ViewId, r.config.NodeId)
 	}
 
 	// add value to the set
@@ -787,20 +790,32 @@ func (r *Replica) handleDoViewChange(doViewChange *DoViewChange) {
 				bestCommitId = current.CommitId
 			}
 		}
-		// fmt.Printf("%v node:%d quorum check on view:%d size:%d, lastLogId:%d commitId:%d\n", r.tt.Now(), r.config.NodeId, doViewChange.ViewId, len(set), best.LastLogId, bestCommitId)
+
+		if len(best.Logs) > 0 && best.Logs[0].LogId > r.commitId+1 {
+			// this can occur if the one with best lastLogId send doViewChange from other nodes commitId
+			// resend the StartViewChange to update the min commit id
+			r.sendTo(best.NodeId, CmdTypeStartViewChange, &StartViewChange{
+				NodeId:   r.config.NodeId,
+				ViewId:   r.viewId,
+				CommitId: r.commitId,
+			})
+			return
+		}
+
 		// update state
-		r.replaceState(best.ViewId, best.LastLogId, bestCommitId, best.Logs, best.NodeId == r.config.NodeId, false)
+		r.replaceState(best.ViewId, best.LastLogId, bestCommitId, best.Logs, false)
 		if r.lastLogId > r.commitId {
 			r.quorumAddPrepareOk(r.lastLogId, r.config.NodeId)
 		}
 		// broadcast start view
-		logs := best.Logs
-		if best.NodeId == r.config.NodeId { // late copy of the logs
-			logs = r.logs.CopyLogs(1, r.lastLogId)
+		minCommitId := uint64(math.MaxUint64)
+		for _, svc := range r.startViewChangeSet[r.viewId] {
+			minCommitId = min(minCommitId, svc.CommitId)
 		}
+
 		r.broadcast(CmdTypeStartView, &StartView{
 			ViewId:    r.viewId,
-			Logs:      logs,
+			Logs:      r.logs.CopyLogs(minCommitId+1, r.lastLogId),
 			LastLogId: r.lastLogId,
 			CommitId:  r.commitId,
 		})
@@ -823,8 +838,17 @@ func (r *Replica) handleStartView(startView *StartView) {
 		return
 	}
 
+	if len(startView.Logs) > 0 && startView.Logs[0].LogId > r.lastLogId+1 || len(startView.Logs) == 0 && startView.LastLogId > r.lastLogId {
+		// has gap in the log, broadcast a GetState request to fill it up
+		r.broadcast(CmdTypeGetState, &GetState{
+			ViewId:    r.viewId,
+			LastLogId: r.commitId,
+		})
+		return
+	}
+
 	// update state
-	r.replaceState(startView.ViewId, startView.LastLogId, startView.CommitId, startView.Logs, false, false)
+	r.replaceState(startView.ViewId, startView.LastLogId, startView.CommitId, startView.Logs, false)
 	// send prepareOk
 	if r.lastLogId > r.commitId {
 		r.sendTo(r.primaryNode(), CmdTypePrepareOk, &PrepareOk{
@@ -898,7 +922,6 @@ func (r *Replica) handleRecoveryResponse(recoveryResponse *RecoveryResponse) {
 			primaryNodeResponse.LastLogId,
 			primaryNodeResponse.CommitId,
 			primaryNodeResponse.Logs,
-			false,
 			true,
 		)
 		// cleanup
@@ -918,9 +941,13 @@ func (r *Replica) handleGetState(fromNodeId int, getState *GetState) {
 		return
 	}
 
+	var logs []RequestLog
+	if getState.LastLogId+1 <= r.lastLogId {
+		logs = r.logs.CopyLogs(getState.LastLogId+1, r.lastLogId)
+	}
 	r.sendTo(fromNodeId, CmdTypeNewState, &NewState{
 		ViewId:    r.viewId,
-		Logs:      r.logs.CopyLogs(getState.LastLogId+1, r.lastLogId),
+		Logs:      logs,
 		LastLogId: r.lastLogId,
 		CommitId:  r.commitId,
 	})
@@ -953,7 +980,8 @@ func (r *Replica) handleNewState(newState *NewState) {
 	}
 
 	// update viewId & lastLogId
-	if r.viewId < newState.ViewId {
+	isViewUpdated := r.viewId < newState.ViewId
+	if isViewUpdated {
 		r.viewId = newState.ViewId
 		if r.status == ReplicaStatusNormal {
 			r.lastNormalViewId = r.viewId
@@ -961,15 +989,11 @@ func (r *Replica) handleNewState(newState *NewState) {
 		r.lastLogId = newState.LastLogId
 		r.logs.Replace(newLogs)
 		r.logs.TruncateFrom(r.lastLogId + 1) // in case old primary have seen a new view
+		r.assertLogState()
 	} else if r.viewId == newState.ViewId && r.lastLogId < newState.LastLogId {
 		r.lastLogId = newState.LastLogId
 		r.logs.Replace(newLogs)
-	}
-
-	// update view
-	r.viewId = newState.ViewId
-	if r.status == ReplicaStatusNormal {
-		r.lastNormalViewId = r.viewId
+		r.assertLogState()
 	}
 
 	// update commit
@@ -979,6 +1003,7 @@ func (r *Replica) handleNewState(newState *NewState) {
 	r.clearInvalidWaitingPrepares()
 	r.clearInvalidDoViewChangeSet()
 	r.updateClientTableByLogs(r.commitId + 1)
+	r.updateLastPreparedLogId()
 
 	// handle next prepare logId if present
 	if nextPrepare, ok := r.waitingPrepares[r.lastLogId+1]; ok {
@@ -986,16 +1011,16 @@ func (r *Replica) handleNewState(newState *NewState) {
 	}
 }
 
-func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []RequestLog, sameNode, recovery bool) {
+func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []RequestLog, recovery bool) {
 	assert.Assertf(viewId > r.lastNormalViewId || recovery, "Should not replaceState to lastNormalViewId, found viewId:%d lastNormalViewId:%d", viewId, r.lastNormalViewId)
 	r.viewId = viewId
 	r.lastNormalViewId = viewId
 	r.lastLogId = lastLogId
 
-	if !sameNode {
-		// copy logs
-		r.logs.Replace(logs)
-	}
+	// copy logs
+	r.logs.Replace(logs)
+	r.logs.TruncateFrom(r.lastLogId + 1)
+	r.assertLogState()
 
 	// commit
 	r.doCommit(commitId, false)
@@ -1004,6 +1029,7 @@ func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []Reques
 	r.clearInvalidWaitingPrepares()
 	r.clearInvalidDoViewChangeSet()
 	r.updateClientTableByLogs(r.commitId + 1)
+	r.updateLastPreparedLogId()
 
 	// update node status
 	r.status = ReplicaStatusNormal
@@ -1077,17 +1103,28 @@ func (r *Replica) doCommit(toCommitId uint64, sendReply bool) {
 	})
 }
 
-func (r *Replica) quorumAddStartViewChange(viewId uint64, nodeId int) uint64 {
-	if r.lastChangedViewId[nodeId] < viewId {
-		r.lastChangedViewId[nodeId] = viewId
+func (r *Replica) quorumAddStartViewChange(nodeId int, viewId uint64, startViewChange *StartViewChange) *StartViewChange {
+	set, ok := r.startViewChangeSet[viewId]
+	if !ok {
+		set = make(map[int]*StartViewChange)
+		r.startViewChangeSet[viewId] = set
 	}
 
-	viewIds := make([]uint64, 0, len(r.lastChangedViewId))
-	viewIds = append(viewIds, r.lastChangedViewId...)
-	sort.Slice(viewIds, func(i, j int) bool { return viewIds[i] > viewIds[j] }) // desc
+	if startViewChange != nil {
+		set[nodeId] = startViewChange
+	}
 
 	threshold := (len(r.config.ServerAddrs))/2 + 1
-	return viewIds[threshold-1]
+	if len(set) >= threshold {
+		var best *StartViewChange
+		for _, svc := range set {
+			if best == nil || best.CommitId > svc.CommitId {
+				best = svc
+			}
+		}
+		return best
+	}
+	return nil
 }
 
 func (r *Replica) storeWaitingPrepare(prepare *Prepare) {
@@ -1124,4 +1161,20 @@ func (r *Replica) updateClientTableByLogs(fromLogId uint64) {
 			reply:     nil,
 		}
 	})
+}
+
+func (r *Replica) updateLastPreparedLogId() {
+	for i := range r.config.ServerAddrs {
+		r.lastPreparedLogId[i] = r.commitId
+	}
+	r.lastPreparedLogId[r.primaryNode()] = r.lastLogId
+	r.lastPreparedLogId[r.config.NodeId] = r.lastLogId
+}
+
+func (r *Replica) assertLogState() {
+	if r.lastLogId > 0 {
+		assert.Assertf(r.logs.LastLog().LogId == r.lastLogId, "Last log id should be in the logs, l:%d", r.lastLogId)
+	} else {
+		assert.Assertf(r.logs.LastLog() == nil, "Last log id should be empty, l:%d", r.lastLogId)
+	}
 }

@@ -23,6 +23,7 @@ VSR
 - [ ] client recovery
 - [ ] checkpointing
 - [x] state transfer
+- [x] suffix based view change
 - [ ] batching
 - [ ] reconfiguration
 

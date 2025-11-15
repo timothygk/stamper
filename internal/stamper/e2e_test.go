@@ -39,7 +39,7 @@ func TestRandomSimulation(t *testing.T) {
 			Seed1:                r.Uint64(),
 			Seed2:                r.Uint64(),
 			RequestPerTick:       1 + r.IntN(5),
-			NumTicks:             1000000,
+			NumTicks:             10000000,
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
@@ -76,12 +76,12 @@ func TestSimulation(t *testing.T) {
 			Seed1:                123,
 			Seed2:                123,
 			RequestPerTick:       1,
-			NumTicks:             1000000,
+			NumTicks:             10000000,
 			TickStep:             500 * time.Microsecond,
 			TransportDelayMean:   500 * time.Microsecond,
 			TransportDelayStdDev: 500 * time.Microsecond,
-			MsgLossProb:          Fraction{1, 1000},
-			CutOffProb:           Fraction{1, 1000},
+			MsgLossProb:          Fraction{15, 1000},
+			CutOffProb:           Fraction{15, 1000},
 			CutOffMean:           10 * time.Second,
 			CutOffStdDev:         5 * time.Second,
 			RepairProb:           Fraction{5, 100},
@@ -626,6 +626,7 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 		n.propagate(true)               // propagate network
 		tt.advanceTime(config.TickStep) // advance time
 	}
+	t.Logf("Cleanup loop done at %v...", tt.now)
 
 	states := []string{}
 	for i, r := range n.replicas {

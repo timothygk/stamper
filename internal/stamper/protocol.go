@@ -118,8 +118,9 @@ type Commit struct {
 }
 
 type StartViewChange struct {
-	ViewId uint64 // view-number
-	NodeId int    // node-id of the backup replica
+	ViewId   uint64 // view-number
+	NodeId   int    // node-id of the backup replica
+	CommitId uint64 // node commit-id
 }
 
 type RequestLog struct {

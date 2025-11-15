@@ -26,6 +26,13 @@ func newLogs() *Logs {
 	return sl
 }
 
+func (sl *Logs) LastLog() *LogEntry {
+	if len(sl.logs) == 0 {
+		return nil
+	}
+	return sl.At(uint64(len(sl.logs)))
+}
+
 func (sl *Logs) At(logId uint64) *LogEntry {
 	assert.Assertf(logId > 0, "logId must be positive, found: %d", logId)
 	index := int(logId) - 1
