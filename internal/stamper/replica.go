@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/timothygk/stamper/internal/assert"
@@ -32,9 +31,6 @@ type eventType int
 
 const (
 	eventTypeReplicaClosing  eventType = 0
-	eventTypeConnAccepted    eventType = 1
-	eventTypeConnClosed      eventType = 2
-	eventTypeSend            eventType = 3
 	eventTypeHeartbeatCommit eventType = 4
 	eventTypeResendPrepares  eventType = 5
 	eventTypeViewChangeTimer eventType = 6
@@ -46,12 +42,6 @@ func (e eventType) String() string {
 	switch e {
 	case eventTypeReplicaClosing:
 		return "replica_closing"
-	case eventTypeConnAccepted:
-		return "conn_accepted"
-	case eventTypeConnClosed:
-		return "conn_closed"
-	case eventTypeSend:
-		return "send"
 	case eventTypeHeartbeatCommit:
 		return "heartbeat_commit"
 	case eventTypeResendPrepares:
@@ -68,22 +58,12 @@ func (e eventType) String() string {
 }
 
 type event struct {
-	etype        eventType
-	envelope     *Envelope
-	conn         net.Conn
-	targetNodeId int
-	commitId     uint64
+	etype    eventType
+	envelope *Envelope
 }
 
 func (e *event) String() string {
-	return fmt.Sprintf(
-		"etype:%s, envelope:%s, conn:%p, nodeId:%d, commitId:%d",
-		e.etype.String(),
-		e.envelope.JsonStr(),
-		e.conn,
-		e.targetNodeId,
-		e.commitId,
-	)
+	return fmt.Sprintf("etype:%s, envelope:%s", e.etype.String(), e.envelope.JsonStr())
 }
 
 type ReplicaConfig struct {
@@ -96,21 +76,11 @@ type ReplicaConfig struct {
 }
 
 type Replica struct {
-	// config
-	config ReplicaConfig
-
-	// time
-	tt timepkg.Time
-
-	// network/communication related
-	encdec      EncoderDecoder
-	createConn  func(toAddr string) (net.Conn, error)
-	conns       []net.Conn
-	serverConns []net.Conn
-	clientConns map[uint64]net.Conn // map of client id -> connection
-	connCloseWg sync.WaitGroup
-	r           *rand.Rand
-	events      chan event
+	// dependencies
+	config ReplicaConfig // config
+	tt     timepkg.Time  // time
+	cm     *connManager  // network/communication related
+	upcall func([]byte) []byte
 
 	// states
 	viewId    uint64
@@ -119,9 +89,9 @@ type Replica struct {
 	logs      *Logs
 	commitId  uint64
 	clients   map[uint64]*clientTable
-	upcall    func([]byte) []byte
 
 	// internal states
+	events            chan event
 	closing           chan struct{}
 	closed            chan struct{}
 	waitingPrepares   map[uint64]*Prepare // logId -> prepare request
@@ -148,23 +118,16 @@ func NewReplica(
 	recovery bool,
 ) *Replica {
 	replica := &Replica{
-		config:     config,
-		tt:         tt,
-		encdec:     encdec,
-		createConn: createConn,
-		// TODO: better connection management?
-		conns:              make([]net.Conn, 0, 10),
-		serverConns:        make([]net.Conn, len(config.ServerAddrs)),
-		clientConns:        make(map[uint64]net.Conn),
-		r:                  r,
-		events:             make(chan event, 1000),
+		config:             config,
+		tt:                 tt,
+		upcall:             upcall,
 		viewId:             0,
 		status:             ReplicaStatusNormal,
 		lastLogId:          0,
 		logs:               newLogs(),
 		commitId:           0,
 		clients:            make(map[uint64]*clientTable),
-		upcall:             upcall,
+		events:             make(chan event, 1000),
 		closing:            make(chan struct{}),
 		closed:             make(chan struct{}),
 		waitingPrepares:    make(map[uint64]*Prepare),
@@ -173,6 +136,7 @@ func NewReplica(
 		startViewChangeSet: make(map[uint64]map[int]*StartViewChange),
 		doViewChangeSet:    make(map[uint64]map[int]*DoViewChange),
 	}
+	replica.cm = newConnManager(config.ServerAddrs, createConn, encdec, replica.onMsgRecv)
 	if recovery {
 		replica.status = ReplicaStatusRecovering
 		replica.recoveryNonce = r.Uint64()
@@ -217,10 +181,7 @@ func (r *Replica) LogHash(logId uint64) []byte {
 
 // Accept accept a network connection
 func (r *Replica) Accept(conn net.Conn) {
-	r.events <- event{
-		etype: eventTypeConnAccepted,
-		conn:  conn,
-	}
+	r.cm.accept(conn)
 }
 
 // Close closes the handler and all its states
@@ -228,8 +189,6 @@ func (r *Replica) Close() error {
 	logging.Logf("[Node %d] closing...\n", r.config.NodeId)
 	close(r.closing)
 	r.events <- event{etype: eventTypeReplicaClosing}
-	r.connCloseWg.Wait()
-	clear(r.clientConns)
 	<-r.closed
 	logging.Logf("[Node %d] closed...\n", r.config.NodeId)
 	return nil
@@ -268,44 +227,8 @@ EventLoop:
 		// logging.Logf("%v [Node %d] Event %s\n", r.tt.Now(), r.config.NodeId, e.String())
 		switch e.etype {
 		case eventTypeReplicaClosing:
-			for _, conn := range r.serverConns {
-				if conn != nil {
-					// logging.Logf("[Node %d] closing conn %p\n", r.config.NodeId, conn)
-					conn.Close()
-				}
-			}
-			for _, conn := range r.conns {
-				if conn != nil {
-					// logging.Logf("[Node %d] closing conn %p\n", r.config.NodeId, conn)
-					conn.Close()
-				}
-			}
+			r.cm.Close()
 			break EventLoop
-		case eventTypeConnAccepted:
-			r.conns = append(r.conns, e.conn)
-			r.connCloseWg.Go(func() { r.listen(e.conn, -1) }) // create goroutine here
-		case eventTypeConnClosed:
-			if e.targetNodeId != -1 {
-				// logging.Logf("[Node %d] closing conn %p\n", r.config.NodeId, r.serverConns[e.targetNodeId])
-				err := r.serverConns[e.targetNodeId].Close()
-				if err != nil {
-					// TODO: log
-				}
-				r.serverConns[e.targetNodeId] = nil // dereference
-			} else {
-				for i, conn := range r.conns {
-					if conn == e.conn {
-						r.conns[i] = nil
-					}
-				}
-				// logging.Logf("[Node %d] closing conn %p\n", r.config.NodeId, e.conn)
-				err := e.conn.Close()
-				if err != nil {
-					// TODO: log
-				}
-			}
-		case eventTypeSend:
-			r.handleSend(e.targetNodeId, e.envelope)
 		case eventTypeHeartbeatCommit:
 			r.handleHeartbeatCommit()
 		case eventTypeResendPrepares:
@@ -315,7 +238,7 @@ EventLoop:
 		case eventTypeInitRecovery:
 			r.handleInitRecovery()
 		case eventTypeMsgRecv:
-			r.handleMsgRecv(e.conn, e.envelope)
+			r.handleMsgRecv(e.envelope)
 		default:
 			assert.Assertf(false, "Unknown event type %d", e.etype)
 		}
@@ -324,99 +247,39 @@ EventLoop:
 	// logging.Logf("[Node %d] Closed\n", r.config.NodeId)
 }
 
-func (r *Replica) listen(conn net.Conn, targetNodeId int) {
-	defer func() {
-		r.events <- event{
-			etype:        eventTypeConnClosed,
-			conn:         conn,
-			targetNodeId: targetNodeId,
-		}
-	}()
-	// logging.Logf("[Node %d] listen conn %p targetNodeId: %d\n", r.config.NodeId, conn, targetNodeId)
-	for {
-		select {
-		case <-r.closing:
-			return
-		default:
-			envelope, err := r.encdec.Decode(conn)
-			if err != nil {
-				return
-			}
-			assert.Assert(envelope != nil, "envelope should not be nil")
-			r.events <- event{
-				etype:    eventTypeMsgRecv,
-				envelope: envelope,
-				conn:     conn,
-			}
-		}
-	}
-}
-
-func (r *Replica) newEnvelope(cmd CmdType, payload any) *Envelope {
-	return &Envelope{
-		Cmd:        cmd,
-		FromNodeId: r.config.NodeId,
-		Payload:    payload,
+func (r *Replica) onMsgRecv(envelope *Envelope) {
+	r.events <- event{
+		etype:    eventTypeMsgRecv,
+		envelope: envelope,
 	}
 }
 
 func (r *Replica) sendReply(clientId uint64, reply *Reply) {
-	conn := r.clientConns[clientId]
-	// logging.Logf("Send reply from server %d to client %d, conn %p..\n", r.config.NodeId, clientId, conn)
-	if conn != nil {
-		envelope := r.newEnvelope(CmdTypeReply, reply)
-		// logging.Logf("Send reply from server %d to client %d, conn %p %s..\n", r.config.NodeId, clientId, conn, envelope.JsonStr())
-		err := r.encdec.Encode(conn, envelope)
-		if err != nil {
-			// on failure, client should ask for the reply again
-			delete(r.clientConns, clientId)
-			conn.Close()
-		}
-	}
+	r.cm.sendReply(clientId, &Envelope{
+		Cmd:        CmdTypeReply,
+		FromNodeId: r.config.NodeId,
+		Payload:    reply,
+	})
 }
 
 func (r *Replica) sendTo(targetNodeId int, cmd CmdType, payload any) {
 	assert.Assertf(targetNodeId != r.config.NodeId, "Should not send to self, cmd:%s", cmd.String())
-
-	// create envlope & wait for ack
-	envelope := r.newEnvelope(cmd, payload)
-	r.events <- event{
-		etype:        eventTypeSend,
-		envelope:     envelope,
-		conn:         nil,
-		targetNodeId: targetNodeId,
-	}
+	r.cm.sendTo(targetNodeId, &Envelope{
+		Cmd:        cmd,
+		FromNodeId: r.config.NodeId,
+		Payload:    payload,
+	})
 }
 
 func (r *Replica) broadcast(cmd CmdType, payload any) {
 	for nodeId := range r.config.ServerAddrs {
 		if nodeId != r.config.NodeId {
-			r.sendTo(nodeId, cmd, payload)
+			r.cm.sendTo(nodeId, &Envelope{
+				Cmd:        cmd,
+				FromNodeId: r.config.NodeId,
+				Payload:    payload,
+			})
 		}
-	}
-}
-
-func (r *Replica) handleSend(targetNodeId int, envelope *Envelope) {
-	assert.Assertf(targetNodeId != r.config.NodeId, "Should not send payload to the same node, node_id:%d\n", targetNodeId)
-	assert.Assert(envelope != nil, "Should not send with nil envelope")
-
-	if r.serverConns[targetNodeId] == nil {
-		conn, err := r.createConn(r.config.ServerAddrs[targetNodeId])
-		if err != nil {
-			// TODO: log this
-			return
-		}
-		r.serverConns[targetNodeId] = conn
-		go r.listen(conn, targetNodeId)
-	}
-
-	conn := r.serverConns[targetNodeId]
-	err := r.encdec.Encode(conn, envelope)
-	if err != nil {
-		// TODO: log this
-		conn.Close()
-		r.serverConns[targetNodeId] = nil
-		return
 	}
 }
 
@@ -485,14 +348,13 @@ func (r *Replica) initViewChange(viewId uint64) {
 	r.quorumAddStartViewChange(r.config.NodeId, r.viewId, svc)
 }
 
-func (r *Replica) handleMsgRecv(conn net.Conn, envelope *Envelope) {
+func (r *Replica) handleMsgRecv(envelope *Envelope) {
 	assert.Assert(envelope != nil, "envelope should not be nil")
 
 	switch envelope.Cmd {
 	case CmdTypeRequest:
 		request, ok := envelope.Payload.(*Request)
 		assert.Assert(ok, "should be able to cast envelope payload to *Request type")
-		r.clientConns[request.ClientId] = conn // add clientId -> connection mapping
 		r.handleRequest(request)
 	case CmdTypePrepare:
 		prepare, ok := envelope.Payload.(*Prepare)

@@ -28,7 +28,7 @@ func TestRandomSimulation(t *testing.T) {
 	r := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
 	for i := range configs {
 		configs[i] = SimulatorConfig{
-			NumServers: r.IntN(2) * 2 + 3,
+			NumServers: r.IntN(2)*2 + 3,
 			NumClients: r.IntN(10) + 5,
 			ReplicaConfig: stamper.ReplicaConfig{
 				SendRetryDuration:       500 * time.Millisecond,
