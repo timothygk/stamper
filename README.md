@@ -32,14 +32,14 @@ Simulation testing
   - [x] mock time
   - [x] mock network
   - [x] out-of-order delivery
-  - [x] simple network delay
-  - [ ] more complex network delay
   - [ ] non-uniform configuration
   - [ ] simulator config random generator
-  - [ ] CI to run simulation with random configurations
+  - [x] CI to run simulation with random configurations
 - [ ] fault injection
+  - [x] network delay
   - [x] message loss
   - [x] simple network partition
+  - [ ] more complex network delay
   - [ ] more complex network partition
   - [x] random recovery
 - [ ] invariants
