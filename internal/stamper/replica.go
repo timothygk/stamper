@@ -551,7 +551,7 @@ func (r *Replica) handlePrepareOk(prepareOk *PrepareOk) {
 
 	toCommitId := r.quorumAddPrepareOk(prepareOk.LogId, prepareOk.NodeId)
 	r.doCommit(toCommitId, true)
-	if toCommitId < r.lastLogId {
+	if toCommitId > r.lastLogId {
 		r.initGetState(prepareOk.ViewId, prepareOk.LogId, 0, true)
 	}
 }
@@ -700,7 +700,7 @@ func (r *Replica) handleStartView(startView *StartView) {
 		return
 	}
 
-	if len(startView.Logs) > 0 && startView.Logs[0].LogId > r.lastLogId+1 || len(startView.Logs) == 0 && startView.LastLogId > r.lastLogId {
+	if len(startView.Logs) > 0 && startView.Logs[0].LogId > r.commitId+1 || len(startView.Logs) == 0 && startView.LastLogId > r.lastLogId {
 		// has gap in the log, broadcast a GetState request to fill it up
 		r.broadcast(CmdTypeGetState, &GetState{
 			ViewId:    r.viewId,
@@ -824,9 +824,10 @@ func (r *Replica) handleNewState(newState *NewState) {
 
 	// remove prefix logs
 	//  - if view id is the same, it should be equal until lastLogId
-	//  - if view id is bigger, it should be equal until commitId
+	//  - if view changed, it should be equal until commitId
+	isViewUpdated := r.viewId < newState.ViewId || r.status == ReplicaStatusViewChange
 	newLogs := newState.Logs
-	for len(newLogs) > 0 && (r.viewId == newState.ViewId && newLogs[0].LogId <= r.lastLogId || newLogs[0].LogId <= r.commitId) {
+	for len(newLogs) > 0 && (!isViewUpdated && newLogs[0].LogId <= r.lastLogId || newLogs[0].LogId <= r.commitId) {
 		requestLog := &newLogs[0]
 		newLogs = newLogs[1:] // pop front
 		// should be sequential
@@ -842,7 +843,6 @@ func (r *Replica) handleNewState(newState *NewState) {
 	}
 
 	// update viewId & lastLogId
-	isViewUpdated := r.viewId < newState.ViewId
 	if isViewUpdated {
 		r.viewId = newState.ViewId
 		if r.status == ReplicaStatusNormal {
@@ -875,6 +875,7 @@ func (r *Replica) handleNewState(newState *NewState) {
 
 func (r *Replica) replaceState(viewId, lastLogId, commitId uint64, logs []RequestLog, recovery bool) {
 	assert.Assertf(viewId > r.lastNormalViewId || recovery, "Should not replaceState to lastNormalViewId, found viewId:%d lastNormalViewId:%d", viewId, r.lastNormalViewId)
+
 	r.viewId = viewId
 	r.lastNormalViewId = viewId
 	r.lastLogId = lastLogId
@@ -902,7 +903,7 @@ func (r *Replica) validateViewId(viewId uint64, shouldBePrimary bool) bool {
 }
 
 func (r *Replica) initGetState(viewId, logId, gap uint64, checkEqView bool) {
-	if r.viewId < viewId || !checkEqView || checkEqView && r.viewId == viewId && r.lastLogId+gap < logId {
+	if r.viewId < viewId || checkEqView && r.viewId == viewId && r.lastLogId+gap < logId {
 		r.broadcast(CmdTypeGetState, &GetState{
 			ViewId:    r.viewId,
 			LastLogId: r.commitId,
