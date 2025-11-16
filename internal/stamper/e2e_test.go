@@ -35,6 +35,7 @@ func TestRandomSimulation(t *testing.T) {
 				CommitDelayDuration:     3 * time.Second,
 				ViewChangeDelayDuration: 6 * time.Second,
 				RecoveryRetryDuration:   6 * time.Second,
+				BatchMaxSize:            10,
 			},
 			Seed1:                r.Uint64(),
 			Seed2:                r.Uint64(),
@@ -66,12 +67,13 @@ func TestSimulation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		simulate(t, &SimulatorConfig{
 			NumServers: 3,
-			NumClients: 10,
+			NumClients: 100,
 			ReplicaConfig: stamper.ReplicaConfig{
 				SendRetryDuration:       500 * time.Millisecond,
 				CommitDelayDuration:     5 * time.Second,
 				ViewChangeDelayDuration: 10 * time.Second,
 				RecoveryRetryDuration:   10 * time.Second,
+				BatchMaxSize:            1000,
 			},
 			Seed1:                123,
 			Seed2:                123,

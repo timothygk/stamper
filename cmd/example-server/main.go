@@ -54,6 +54,7 @@ func main() {
 		CommitDelayDuration:     5 * time.Second,
 		ViewChangeDelayDuration: 10 * time.Second,
 		RecoveryRetryDuration:   10 * time.Second,
+		BatchMaxSize:            1000,
 		NodeId:                  nodeId,
 		ServerAddrs:             addrs,
 	}

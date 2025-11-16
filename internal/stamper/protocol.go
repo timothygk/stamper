@@ -93,10 +93,9 @@ type Request struct {
 }
 
 type Prepare struct {
-	ViewId        uint64   // view-number
-	LogId         uint64   // op-number assigned by primary node
-	CommitId      uint64   // primary node commit-number
-	ClientRequest *Request // the request from client
+	ViewId        uint64 // view-number
+	CommitId      uint64 // primary node commit-number
+	Requests      []RequestLog
 }
 
 type PrepareOk struct {

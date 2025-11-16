@@ -71,6 +71,7 @@ type ReplicaConfig struct {
 	CommitDelayDuration     time.Duration
 	ViewChangeDelayDuration time.Duration
 	RecoveryRetryDuration   time.Duration
+	BatchMaxSize            int
 	NodeId                  int
 	ServerAddrs             []string // configurations, currently it is static
 }
@@ -97,6 +98,7 @@ type Replica struct {
 	waitingPrepares   map[uint64]*Prepare // logId -> prepare request
 	lastPreparedLogId []uint64            // node -> last prepared log id
 	lastCommitAt      time.Time           // last commit time
+	lastRequestAt     time.Time           // last request time
 	// view-change related
 	lastNormalViewId   uint64
 	startViewChangeSet map[uint64]map[int]*StartViewChange
@@ -450,20 +452,23 @@ func (r *Replica) handleRequest(request *Request) {
 	}
 
 	// advance log and add to client table
-	r.appendLog(request)
+	r.lastLogId++
+	requestLog := RequestLog{
+		LogId:     r.lastLogId,
+		ClientId:  request.ClientId,
+		RequestId: request.RequestId,
+		Body:      request.RequestBody,
+	}
+	r.logs.Append(requestLog)
+	r.onAppendLog(requestLog)
 
 	// add to quorum
 	toCommitId := r.quorumAddPrepareOk(r.lastLogId, r.config.NodeId)
 	assert.Assert(toCommitId <= r.commitId, "Primary quorumAddPrepareOk should not commit anything")
 
-	// broadcast prepare request
-	r.broadcast(CmdTypePrepare, &Prepare{
-		ViewId:        r.viewId,
-		LogId:         r.lastLogId,
-		CommitId:      r.commitId,
-		ClientRequest: request,
-	})
-	r.lastCommitAt = r.tt.Now()
+	if r.commitId + uint64(r.config.BatchMaxSize) >= r.lastLogId {
+		r.handleResendPrepares() // send prepares
+	}
 }
 
 func (r *Replica) handleResendPrepares() {
@@ -474,20 +479,15 @@ func (r *Replica) handleResendPrepares() {
 		return
 	}
 
-	// TODO: fix this, currently it is hardcoded to the first 100 msgs only
-	r.logs.Iterate(r.commitId+1, min(r.commitId+100, r.lastLogId), func(entry *LogEntry) {
+	logs := r.logs.CopyLogs(r.commitId+1, min(r.commitId+uint64(r.config.BatchMaxSize), r.lastLogId))
+	if len(logs) > 0 {
 		r.broadcast(CmdTypePrepare, &Prepare{
 			ViewId:   r.viewId,
-			LogId:    entry.LogId,
 			CommitId: r.commitId,
-			ClientRequest: &Request{
-				ClientId:    entry.ClientId,
-				RequestId:   entry.RequestId,
-				RequestBody: entry.Body,
-			},
+			Requests: logs,
 		})
 		r.lastCommitAt = r.tt.Now()
-	})
+	}
 }
 
 func (r *Replica) handlePrepare(prepare *Prepare) {
@@ -497,12 +497,12 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 		return // replica in view change or recovery mode
 	}
 	if !r.validateViewId(prepare.ViewId, false) {
+		minLogId := uint64(0)
+		if len(prepare.Requests) > 0 {
+			minLogId = prepare.Requests[0].LogId
+		}
 		r.storeWaitingPrepare(prepare)
-		r.initGetState(prepare.ViewId, prepare.LogId, 1, false)
-		return
-	}
-	if r.lastLogId >= prepare.LogId {
-		// already existed
+		r.initGetState(prepare.ViewId, minLogId, 1, false)
 		return
 	}
 
@@ -512,22 +512,40 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
 	// backup to apply commit from h.lastLogId + 1 until prepare.CommitId
 	r.doCommit(prepare.CommitId, false)
 
-	if r.lastLogId+1 < prepare.LogId {
+	if r.lastLogId+1 < prepare.Requests[0].LogId {
 		r.storeWaitingPrepare(prepare)
-		r.initGetState(prepare.ViewId, prepare.LogId, 1, true)
+		r.initGetState(prepare.ViewId, prepare.Requests[0].LogId, 1, true)
 		return
 	}
 
 	// advance log and add to client table
-	r.appendLog(prepare.ClientRequest)
+	hasAppend := false
+	for i := range prepare.Requests {
+		request := prepare.Requests[i]
+		if request.LogId <= r.lastLogId {
+			continue
+		}
+		if r.lastLogId+1 < request.LogId {
+			r.storeWaitingPrepare(prepare)
+			r.initGetState(prepare.ViewId, prepare.Requests[0].LogId, 1, true)
+			break
+		}
 
-	// send PrepareOk to primary node
-	primaryNodeId := r.primaryNode()
-	r.sendTo(primaryNodeId, CmdTypePrepareOk, &PrepareOk{
-		ViewId: r.viewId,
-		LogId:  r.lastLogId,
-		NodeId: r.config.NodeId,
-	})
+		r.lastLogId++
+		r.logs.Append(request)
+		r.onAppendLog(request)
+		hasAppend = true
+	}
+
+	if hasAppend {
+		// send PrepareOk to primary node
+		primaryNodeId := r.primaryNode()
+		r.sendTo(primaryNodeId, CmdTypePrepareOk, &PrepareOk{
+			ViewId: r.viewId,
+			LogId:  r.lastLogId,
+			NodeId: r.config.NodeId,
+		})
+	}
 
 	// handle next prepare if present
 	if nextPrepare, ok := r.waitingPrepares[r.lastLogId+1]; ok {
@@ -915,14 +933,7 @@ func (r *Replica) primaryNode() int {
 	return int(r.viewId) % len(r.config.ServerAddrs)
 }
 
-func (r *Replica) appendLog(request *Request) {
-	r.lastLogId++
-	r.logs.Append(RequestLog{
-		LogId:     r.lastLogId,
-		ClientId:  request.ClientId,
-		RequestId: request.RequestId,
-		Body:      request.RequestBody,
-	})
+func (r *Replica) onAppendLog(request RequestLog) {
 	r.clients[request.ClientId] = &clientTable{
 		requestId: request.RequestId,
 		reply:     nil,
@@ -992,8 +1003,18 @@ func (r *Replica) quorumAddStartViewChange(nodeId int, viewId uint64, startViewC
 
 func (r *Replica) storeWaitingPrepare(prepare *Prepare) {
 	// only update mapping if it has more advanced view
-	if waitingPrepare, ok := r.waitingPrepares[prepare.LogId]; !ok || waitingPrepare.ViewId < prepare.ViewId {
-		r.waitingPrepares[prepare.LogId] = prepare
+	for i := range prepare.Requests {
+		request := prepare.Requests[i]
+		if request.LogId <= r.lastLogId {
+			continue
+		}
+		if waitingPrepare, ok := r.waitingPrepares[request.LogId]; !ok || waitingPrepare.ViewId < prepare.ViewId {
+			r.waitingPrepares[request.LogId] = &Prepare{
+				ViewId:   prepare.ViewId,
+				CommitId: prepare.CommitId,
+				Requests: []RequestLog{request},
+			}
+		}
 	}
 }
 

@@ -24,7 +24,7 @@ VSR
 - [ ] checkpointing
 - [x] state transfer
 - [x] suffix based view change
-- [ ] batching
+- [x] batching
 - [ ] reconfiguration
 
 Simulation testing
