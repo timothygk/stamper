@@ -40,7 +40,14 @@ func (sl *Logs) At(logId uint64) *LogEntry {
 	return &sl.logs[index]
 }
 
-func (sl *Logs) Append(entry LogEntry) {
+func (sl *Logs) Append(requestLog RequestLog) {
+	entry := LogEntry{
+		ClientId:  requestLog.ClientId,
+		RequestId: requestLog.RequestId,
+		LogId:     requestLog.LogId,
+		Body:      bytes.Clone(requestLog.Body),
+	}
+
 	assert.Assertf(
 		uint64(len(sl.logs))+1 == entry.LogId,
 		"Next log id should match len + 1, found len:%d logId:%d",
@@ -68,12 +75,7 @@ func (sl *Logs) Replace(newLogs []RequestLog) {
 	// reinit & reappend
 	for i := range newLogs {
 		assert.Assertf(newLogs[i].LogId == uint64(len(sl.logs))+1, "Expected sequential, found logId:%d len:%d", newLogs[i].LogId, len(sl.logs))
-		sl.Append(LogEntry{
-			ClientId:  newLogs[i].ClientId,
-			RequestId: newLogs[i].RequestId,
-			LogId:     newLogs[i].LogId,
-			Body:      bytes.Clone(newLogs[i].Body),
-		})
+		sl.Append(newLogs[i])
 	}
 }
 

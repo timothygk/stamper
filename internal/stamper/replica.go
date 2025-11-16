@@ -917,11 +917,11 @@ func (r *Replica) primaryNode() int {
 
 func (r *Replica) appendLog(request *Request) {
 	r.lastLogId++
-	r.logs.Append(LogEntry{
+	r.logs.Append(RequestLog{
 		LogId:     r.lastLogId,
 		ClientId:  request.ClientId,
 		RequestId: request.RequestId,
-		Body:      bytes.Clone(request.RequestBody), // copy
+		Body:      request.RequestBody,
 	})
 	r.clients[request.ClientId] = &clientTable{
 		requestId: request.RequestId,
