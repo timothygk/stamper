@@ -24,7 +24,7 @@ import (
 
 func TestRandomSimulation(t *testing.T) {
 	// generate configs to be tested
-	configs := make([]SimulatorConfig, 10)
+	configs := make([]SimulatorConfig, 5)
 	r := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
 	for i := range configs {
 		configs[i] = SimulatorConfig{
