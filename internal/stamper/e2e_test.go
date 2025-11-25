@@ -605,7 +605,7 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 		n.propagate(false)              // propagate network messages
 		tt.advanceTime(config.TickStep) // advance time
 
-		if tickCnt%100000 == 0 {
+		if tickCnt%1000000 == 0 {
 			t.Logf(
 				"At tick %d, timers:%d tickers:%d managedconn:%d numGoroutines=%d",
 				tickCnt,

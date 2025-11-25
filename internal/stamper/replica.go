@@ -466,7 +466,7 @@ func (r *Replica) handleRequest(request *Request) {
 	toCommitId := r.quorumAddPrepareOk(r.lastLogId, r.config.NodeId)
 	assert.Assert(toCommitId <= r.commitId, "Primary quorumAddPrepareOk should not commit anything")
 
-	if r.commitId + uint64(r.config.BatchMaxSize) >= r.lastLogId {
+	if r.commitId+uint64(r.config.BatchMaxSize) >= r.lastLogId {
 		r.handleResendPrepares() // send prepares
 	}
 }
@@ -588,7 +588,7 @@ func (r *Replica) handleCommit(commit *Commit) {
 	// reset view change timer since there's a message from primary node
 	r.viewChangeTimer.Reset(r.config.ViewChangeDelayDuration)
 	r.doCommit(commit.CommitId, false)
-	if commit.CommitId < r.lastLogId {
+	if commit.CommitId > r.lastLogId {
 		r.initGetState(commit.ViewId, commit.CommitId, 0, true)
 	}
 }
