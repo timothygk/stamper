@@ -631,11 +631,13 @@ func simulate(t *testing.T, config *SimulatorConfig) {
 	t.Logf("Cleanup loop done at %v...", tt.now)
 
 	states := []string{}
+	for i := range n.replicas {
+		states = append(states, n.getReplicaState(i))
+		t.Logf("Replica %d, state: %s", i, states[i])
+	}
 	for i, r := range n.replicas {
 		// should eventually be in normal state
 		assert.Assertf(r.Status() == stamper.ReplicaStatusNormal, "Status wasn't normal on node %d, %d", i, r.Status())
-		states = append(states, n.getReplicaState(i))
-		t.Logf("Replica %d, state: %s", i, states[i])
 	}
 	for i := range len(states) - 1 {
 		assert.Assertf(

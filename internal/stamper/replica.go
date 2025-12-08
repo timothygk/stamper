@@ -339,6 +339,10 @@ func (r *Replica) handleInitRecovery() {
 }
 
 func (r *Replica) initViewChange(viewId uint64) {
+	if r.viewId != viewId || r.status != ReplicaStatusViewChange {
+		// reset timer if viewId or status changed
+		r.viewChangeTimer.Reset(r.config.ViewChangeDelayDuration)
+	}
 	r.status = ReplicaStatusViewChange
 	r.viewId = viewId
 	svc := &StartViewChange{
